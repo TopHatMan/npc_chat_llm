@@ -1,0 +1,91 @@
+[worldserver]
+
+########################################
+# mod-npc-chat configuration
+########################################
+#
+# Talk to any targeted world NPC and get an AI reply in a chat bubble.
+# Target a creature, /say something within range, and it answers in character.
+# Each NPC keeps a flat .history file of its conversations.
+
+# NpcChat.Enable
+#     Enable (1) or disable (0) the module.
+#     Default: 0
+NpcChat.Enable = 1
+
+# --------------------------------------------
+# API CONNECTION (OpenAI-compatible)
+# --------------------------------------------
+
+# NpcChat.BaseUrl
+#     Base URL of the LLM API. "/chat/completions" is appended automatically.
+#     Default: https://openrouter.ai/api/v1
+NpcChat.BaseUrl = https://openrouter.ai/api/v1
+
+# NpcChat.ApiKey
+#     Bearer token. Leave blank for a local keyless endpoint (Ollama/LM Studio).
+NpcChat.ApiKey =
+
+# NpcChat.Model
+#     Model identifier. REQUIRED.
+#     A cheap, fast model is plenty for short in-character replies.
+NpcChat.Model = google/gemini-2.5-flash-lite
+
+# NpcChat.MaxResponseTokens
+#     Cap on generated tokens. Small = short bubbles + cheaper. Default: 150
+NpcChat.MaxResponseTokens = 150
+
+# NpcChat.Temperature
+#     Sampling temperature. Default: 0.8
+NpcChat.Temperature = 0.8
+
+# NpcChat.RequestTimeoutSec
+#     HTTP timeout in seconds. Default: 30
+NpcChat.RequestTimeoutSec = 30
+
+# NpcChat.ModelExtraParameters
+#     Raw JSON fragment merged into every request body. Single quotes are
+#     converted to double quotes at runtime. Use this to disable reasoning on
+#     models that bill thinking tokens.
+#     Example: 'reasoning_effort':'low'
+#     Example: 'thinking':{'type':'disabled'}
+NpcChat.ModelExtraParameters =
+
+# --------------------------------------------
+# CONVERSATION / HISTORY
+# --------------------------------------------
+
+# NpcChat.HistoryPath
+#     Directory for per-NPC .history files (created if missing).
+#     Relative to the server working directory.
+NpcChat.HistoryPath = ./AI_RP/npc_history
+
+# NpcChat.HistoryMaxLines
+#     How many recent conversation lines are sent back to the model as context.
+#     This is the main cost dial — keep it modest. Default: 20  (~10 exchanges)
+NpcChat.HistoryMaxLines = 20
+
+# NpcChat.NameByEntry
+#     1 = file per NPC type, e.g. Hogger_448.history (avoids same-name collisions).
+#     0 = original behaviour: one file per name, e.g. Hogger.history
+#         (every "Stormwind Guard" then shares a single log).
+#     Default: 1
+NpcChat.NameByEntry = 1
+
+# --------------------------------------------
+# TRIGGER
+# --------------------------------------------
+
+# NpcChat.TriggerRange
+#     Max yards between you and the targeted NPC for /say to reach it. Default: 25
+NpcChat.TriggerRange = 25
+
+# NpcChat.RequirePrefix
+#     1 = only route /say to the NPC when the message starts with NpcChat.Prefix
+#         (so normal /say is never hijacked). 0 = any /say with an NPC targeted.
+#     Default: 0
+NpcChat.RequirePrefix = 0
+
+# NpcChat.Prefix
+#     Prefix string used when RequirePrefix = 1, e.g. "@". Stripped before sending.
+NpcChat.Prefix =
