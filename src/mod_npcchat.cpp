@@ -141,6 +141,22 @@ namespace
 
         g_SubPromptCreatorAccounts = ParseAccountIdList(
             sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccounts", ""));
+
+        // Accept a couple of aliases too, so a typo/name preference in the conf
+        // does not leave a trusted play account locked out.
+        auto mergeAccountIds = [](std::vector<uint32>& dst, std::vector<uint32> const& src)
+            {
+                for (uint32 id : src)
+                {
+                    if (id && std::find(dst.begin(), dst.end(), id) == dst.end())
+                        dst.push_back(id);
+                }
+            };
+
+        mergeAccountIds(g_SubPromptCreatorAccounts, ParseAccountIdList(
+            sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccountIds", "")));
+        mergeAccountIds(g_SubPromptCreatorAccounts, ParseAccountIdList(
+            sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccountIDs", "")));
     }
 }
 
@@ -1139,6 +1155,26 @@ private:
         return IsGm(handler) || IsSubPromptCreatorAccount(handler);
     }
 
+    static bool CanManageSharedSubPrompts(ChatHandler* handler)
+    {
+        return IsGm(handler) || IsSubPromptCreatorAccount(handler);
+    }
+
+    static std::string JoinAccountIds(std::vector<uint32> const& ids)
+    {
+        if (ids.empty())
+            return "(none)";
+
+        std::ostringstream ss;
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            if (i)
+                ss << ",";
+            ss << ids[i];
+        }
+        return ss.str();
+    }
+
     static Player* GetCommandPlayer(ChatHandler* handler)
     {
         if (!handler || !handler->GetSession())
@@ -1176,7 +1212,7 @@ private:
             handler->PSendSysMessage("GM: .npcc prompt shared [quoted shared prompt]");
             handler->PSendSysMessage("GM: .npcc prompt default [quoted default prompt]");
             handler->PSendSysMessage("GM/Allowed: .npcc sub create <name> [quoted prompt text]");
-            handler->PSendSysMessage("GM: .npcc sub attach shared <name>");
+            handler->PSendSysMessage("GM/Allowed: .npcc sub attach shared <name>");
             return true;
         }
 
@@ -1185,6 +1221,7 @@ private:
             handler->PSendSysMessage("NPC Chat account ID: {}", GetCommandAccountId(handler));
             handler->PSendSysMessage("NPC Chat GM: {}", IsGm(handler) ? "yes" : "no");
             handler->PSendSysMessage("NPC Chat sub-prompt creator: {}", CanCreateSubPrompts(handler) ? "yes" : "no");
+            handler->PSendSysMessage("NPC Chat loaded creator account IDs: {}", JoinAccountIds(g_SubPromptCreatorAccounts));
             return true;
         }
 
@@ -1257,7 +1294,7 @@ private:
                 handler->PSendSysMessage(".npcc sub detach <name>");
                 handler->PSendSysMessage(".npcc sub clear");
                 handler->PSendSysMessage("GM/Allowed: .npcc sub create <name> [quoted prompt text]");
-                handler->PSendSysMessage("GM: .npcc sub attach shared <name>");
+                handler->PSendSysMessage("GM/Allowed: .npcc sub attach shared <name>");
                 handler->PSendSysMessage("GM: .npcc sub detach shared <name>");
                 handler->PSendSysMessage("GM: .npcc sub clear shared");
                 return true;
@@ -1392,12 +1429,15 @@ private:
                 }
                 else
                 {
-                    mode = IsGm(handler) ? "shared" : "personal";
+                    // GMs and configured creator accounts default to shared/global attachments.
+                    // Regular players still default to personal-only attachments.
+                    mode = CanManageSharedSubPrompts(handler) ? "shared" : "personal";
                 }
 
-                if (mode == "shared" && !IsGm(handler))
+                if (mode == "shared" && !CanManageSharedSubPrompts(handler))
                 {
-                    handler->PSendSysMessage("Only GMs may edit shared NPC Chat sub-prompt attachments.");
+                    handler->PSendSysMessage("Only GMs or configured NPC Chat sub-prompt creator accounts may edit shared NPC Chat sub-prompt attachments.");
+                    handler->PSendSysMessage("Use .npcc account to see your account ID and loaded allowlist.");
                     return true;
                 }
 
