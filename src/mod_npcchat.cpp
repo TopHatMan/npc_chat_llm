@@ -66,8 +66,10 @@ namespace
     bool        g_NameByEntry = true;
 
     float       g_TriggerRange = 25.0f;          // friendly / neutral NPC max chat range
-    bool        g_AllowHostileChat = true;       // hostile NPC parley mode
-    float       g_HostileMinDistance = 30.0f;    // stay far enough to avoid normal aggro
+    bool        g_AllowHostileChat = true;       // hostile NPC parley / combat talk mode
+    bool        g_HostileAllowCloseChat = true;  // allow hostile NPC chat even inside normal aggro range
+    bool        g_HostileAllowCombatChat = true; // allow hostile NPC chat while player/NPC are in combat
+    float       g_HostileMinDistance = 30.0f;    // used only when close hostile chat is disabled
     float       g_HostileMaxDistance = 100.0f;   // still close enough to "shout"
     bool        g_HostileForcePrivateReply = true;
 
@@ -132,6 +134,8 @@ namespace
 
         g_TriggerRange = sConfigMgr->GetOption<float>("NpcChat.TriggerRange", 25.0f);
         g_AllowHostileChat = sConfigMgr->GetOption<bool>("NpcChat.AllowHostileChat", true);
+        g_HostileAllowCloseChat = sConfigMgr->GetOption<bool>("NpcChat.HostileAllowCloseChat", true);
+        g_HostileAllowCombatChat = sConfigMgr->GetOption<bool>("NpcChat.HostileAllowCombatChat", true);
         g_HostileMinDistance = sConfigMgr->GetOption<float>("NpcChat.HostileMinDistance", 30.0f);
         g_HostileMaxDistance = sConfigMgr->GetOption<float>("NpcChat.HostileMaxDistance", 100.0f);
         g_HostileForcePrivateReply = sConfigMgr->GetOption<bool>("NpcChat.HostileForcePrivateReply", true);
@@ -184,7 +188,13 @@ namespace
         std::string zoneName;
 
         bool        isHostile = false;
+        bool        npcInCombat = false;
+        bool        playerInCombat = false;
+        bool        npcTargetingPlayer = false;
+        float       npcHealthPct = 100.0f;
+        float       playerHealthPct = 100.0f;
         float       distance = 0.0f;
+        std::string fightState;
         bool        forcePrivateReply = false;
 
         std::string message;
@@ -227,6 +237,53 @@ namespace
                 return static_cast<char>(std::tolower(c));
             });
         return s;
+    }
+
+    float UnitHealthPct(Unit const* unit)
+    {
+        if (!unit)
+            return 0.0f;
+
+        uint64 maxHealth = unit->GetMaxHealth();
+        if (!maxHealth)
+            return 0.0f;
+
+        return (float(unit->GetHealth()) * 100.0f) / float(maxHealth);
+    }
+
+    std::string BuildFightState(float npcHp, float playerHp, bool npcInCombat, bool playerInCombat, bool npcTargetingPlayer)
+    {
+        if (!npcInCombat && !playerInCombat)
+            return "No active fight has started yet.";
+
+        std::ostringstream ss;
+        if (npcTargetingPlayer)
+            ss << "The NPC is actively fighting the speaker. ";
+        else if (npcInCombat || playerInCombat)
+            ss << "Combat is nearby or already underway. ";
+
+        if (npcHp <= 20.0f)
+            ss << "The NPC is badly wounded. ";
+        else if (npcHp <= 45.0f)
+            ss << "The NPC is losing ground. ";
+        else if (npcHp >= 85.0f)
+            ss << "The NPC still looks strong. ";
+
+        if (playerHp <= 20.0f)
+            ss << "The speaker is badly hurt. ";
+        else if (playerHp <= 45.0f)
+            ss << "The speaker is under real pressure. ";
+        else if (playerHp >= 85.0f)
+            ss << "The speaker still looks strong. ";
+
+        if (npcHp + 20.0f < playerHp)
+            ss << "Overall, the speaker appears to be winning.";
+        else if (playerHp + 20.0f < npcHp)
+            ss << "Overall, the NPC appears to be winning.";
+        else
+            ss << "Overall, the fight looks close.";
+
+        return TrimCopy(ss.str());
     }
 
     std::string StripWrappingQuotes(std::string s)
@@ -752,8 +809,10 @@ namespace
 
         if (req.isHostile)
         {
-            ss << " This is a tense shouted exchange at a distance before possible combat.";
+            ss << " This is hostile enemy communication. It may be a distant parley, a close threat, or active fight banter.";
             ss << " Do not become friendly just because the enemy speaks to you.";
+            ss << " If combat is underway, react like an enemy under pressure: taunt, threaten, bargain, panic, boast, rage, or refuse as fits your nature.";
+            ss << " Do not mention exact health percentages unless the speaker directly asks about wounds or weakness.";
         }
 
         if (!defaultPrompt.empty())
@@ -812,7 +871,19 @@ namespace
         }
 
         if (req.isHostile)
-            ss << req.playerName << " calls out to you from " << req.distance << " yards away: \"" << req.message << "\"\n\n";
+        {
+            ss << "Hostile/combat context:\n";
+            ss << "- Distance from speaker: " << req.distance << " yards.\n";
+            ss << "- Your health: about " << req.npcHealthPct << "%.\n";
+            ss << "- Speaker health: about " << req.playerHealthPct << "%.\n";
+            ss << "- You are in combat: " << (req.npcInCombat ? "yes" : "no") << ".\n";
+            ss << "- Speaker is in combat: " << (req.playerInCombat ? "yes" : "no") << ".\n";
+            ss << "- You are directly targeting/fighting the speaker: " << (req.npcTargetingPlayer ? "yes" : "no") << ".\n";
+            if (!req.fightState.empty())
+                ss << "- Fight read: " << req.fightState << "\n";
+            ss << "\n";
+            ss << req.playerName << " says to you as an enemy: \"" << req.message << "\"\n\n";
+        }
         else
             ss << req.playerName << " says to you: \"" << req.message << "\"\n\n";
 
@@ -987,17 +1058,29 @@ private:
         bool const isHostile = npc->IsHostileTo(player);
         float const distance = player->GetDistance(npc);
 
+        bool const npcInCombat = npc->IsInCombat();
+        bool const playerInCombat = player->IsInCombat();
+        bool const npcTargetingPlayer = npc->GetVictim() == player;
+        bool const hostileCombatTalk = isHostile && (npcInCombat || playerInCombat);
+
         if (isHostile)
         {
             if (!g_AllowHostileChat)
                 return true;
 
-            // Hostile conversations are "parley" from outside normal aggro range.
-            // If the player is too close, let normal combat/aggro behavior win.
-            if (distance < g_HostileMinDistance || distance > g_HostileMaxDistance)
+            if (hostileCombatTalk && !g_HostileAllowCombatChat)
                 return true;
 
-            if (g_HostileForcePrivateReply)
+            // Hostile chat can now work close and far. If close hostile chat is disabled,
+            // keep the old parley minimum range behavior.
+            if (!g_HostileAllowCloseChat && distance < g_HostileMinDistance)
+                return true;
+
+            if (distance > g_HostileMaxDistance)
+                return true;
+
+            // Far hostile speech may not be visible as normal /say, so force private at range.
+            if (g_HostileForcePrivateReply || distance > g_TriggerRange)
                 forcePrivateReply = true;
         }
         else
@@ -1025,7 +1108,13 @@ private:
         }
 
         req.isHostile = isHostile;
+        req.npcInCombat = npcInCombat;
+        req.playerInCombat = playerInCombat;
+        req.npcTargetingPlayer = npcTargetingPlayer;
+        req.npcHealthPct = UnitHealthPct(npc);
+        req.playerHealthPct = UnitHealthPct(player);
         req.distance = distance;
+        req.fightState = BuildFightState(req.npcHealthPct, req.playerHealthPct, npcInCombat, playerInCombat, npcTargetingPlayer);
         req.forcePrivateReply = forcePrivateReply;
 
         if (isHostile)
