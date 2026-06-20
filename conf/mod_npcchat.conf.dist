@@ -115,3 +115,10 @@ NpcChat.RequirePrefix = 0
 # NpcChat.Prefix
 #     Prefix string used when RequirePrefix = 1, e.g. "@". Stripped before sending.
 NpcChat.Prefix =
+###################################################################################################
+# NPC Chat LLM - sub-prompt creator allowlist
+# Comma-separated account IDs allowed to run .npcc sub create without GM security.
+# In-game: use .npcc account to see the current account ID.
+###################################################################################################
+
+NpcChat.SubPromptCreatorAccounts =
