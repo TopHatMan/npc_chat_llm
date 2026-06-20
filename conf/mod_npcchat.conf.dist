@@ -72,6 +72,32 @@ NpcChat.HistoryMaxLines = 20
 #     Default: 1
 NpcChat.NameByEntry = 1
 
+# ------------------------------------------------------------
+# mod-npc-chat-llm prompt/history + hostile parley settings
+# ------------------------------------------------------------
+
+# Root NPC chat folder. Module will create:
+#   default.prompt
+#   shared/
+#   personal/
+NpcChat.HistoryPath = ./AI_RP/npc_history
+
+# Friendly/neutral NPC normal chat range.
+NpcChat.TriggerRange = 25.0
+
+# Hostile NPC parley mode.
+# Lets you target a hostile NPC and speak from outside normal aggro range.
+NpcChat.AllowHostileChat = 1
+NpcChat.HostileMinDistance = 30.0
+NpcChat.HostileMaxDistance = 100.0
+NpcChat.HostileForcePrivateReply = 1
+
+# Optional trigger prefix. Leave RequirePrefix = 0 if you want normal /say to work.
+# If enabled, example: NpcChat.Prefix = !
+NpcChat.RequirePrefix = 0
+NpcChat.Prefix = 
+
+
 # --------------------------------------------
 # TRIGGER
 # --------------------------------------------
