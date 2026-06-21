@@ -1,32 +1,48 @@
-# FEATURES.md
+# mod-npc-chat-llm Features
 
-# mod-npc-chat-llm Features and Design
+This document tracks the feature set and design direction of `mod-npc-chat-llm`.
 
-This document tracks the current feature set, intended design direction, and planned expansions for `mod-npc-chat-llm`.
+## Design philosophy
 
-The project goal is to give AzerothCore NPCs lightweight, persistent, in-character conversational behavior through an LLM while keeping the core safe, stable, and easy to configure.
+`mod-npc-chat-llm` is built around a simple idea:
 
-## Core design goals
+```text
+Use code to identify the NPC.
+Use prompt files to define personality.
+Use histories to preserve memory.
+Use commands to let worldbuilders shape the realm while playing.
+```
 
-The module should:
+It is intentionally not a giant AI framework. It is a lightweight NPC roleplay layer for AzerothCore.
 
-- let players talk to targeted NPCs naturally
-- keep NPCs in character
-- remember past interactions
-- separate shared public NPC memory from personal player/NPC memory
-- support editable prompt files instead of requiring C++ edits
-- support both friendly NPC conversation and hostile “parley before combat”
-- avoid touching live game objects from worker threads
-- stay small and practical for a private server
-- avoid becoming a giant dependency-heavy AI framework
+## Implemented feature summary
 
-## Current implemented features
+- OpenAI-compatible chat completion calls
+- Safe worker-thread LLM requests
+- Main-thread-only game-object access
+- Real-player-only triggering
+- Targeted NPC conversation
+- Public and private NPC replies
+- Shared NPC memory
+- Personal player/NPC memory
+- Editable `default.prompt`
+- Shared NPC prompt files
+- Personal NPC prompt files
+- Reusable sub-prompt archetype files
+- Shared and personal sub-prompt attachments
+- `.npcc` command namespace
+- Trusted non-GM account allowlist
+- Hostile NPC parley
+- Hostile close-range conversation
+- Hostile combat conversation
+- Combat-context prompt injection
+- AI-generated shared/personal character prompts
 
-## 1. OpenAI-compatible LLM calls
+## 1. OpenAI-compatible LLM API
 
-The module currently uses an OpenAI-compatible `/chat/completions` request.
+The module uses an OpenAI-compatible `/chat/completions` endpoint.
 
-Supported API settings:
+Supported settings:
 
 ```ini
 NpcChat.BaseUrl
@@ -40,108 +56,129 @@ NpcChat.ModelExtraParameters
 
 The HTTP helper supports:
 
-- base URL parsing
-- HTTP or HTTPS depending on build support
+- HTTP/HTTPS client selection depending on build support
 - bearer token authorization
 - JSON request construction
 - `model`
 - `temperature`
 - `max_tokens`
-- extra raw JSON parameters
+- extra raw JSON body parameters
 - response parsing from `choices[0].message.content`
 - retry attempt
-- newline cleanup
-- trimming of simple wrapper quotes
+- trimming and cleanup of model output
 
 ## 2. Safe thread split
 
-The module is designed around a safe split:
+The module follows a strict safety model:
 
 ```text
-PlayerScript hook:
-  validates the message and selected NPC
-  copies primitive player/NPC data into ChatRequest
-  starts a detached worker
+PlayerScript / command handler:
+  validate player, message, target
+  copy primitive data
+  start worker thread
 
 Worker thread:
-  loads history
-  appends player message
-  calls the LLM
-  appends NPC reply
-  queues ChatReply
+  assemble prompt
+  read/write prompt and history files
+  call LLM
+  queue reply
 
 WorldScript::OnUpdate:
-  reads queued replies
-  finds the live player/NPC again
-  emits the NPC response
+  pop queued replies
+  find live objects again
+  send speech or system messages
 ```
 
-Game-object pointers are not used off-thread.
+Live AzerothCore objects are not used from worker threads.
 
-## 3. Real-player-only triggering
+## 3. Real-player-only chat triggering
 
-The module ignores bot sessions so playerbots do not trigger random LLM calls.
+The module ignores bot sessions and dot commands.
 
-Current behavior:
+A message can trigger NPC chat when:
 
-```text
-real player speaks in /say
-selected target is a live creature
-player is within trigger range
-message passes prefix rules
-module starts NPC chat request
-```
+- module is enabled
+- player is real
+- player has a creature selected
+- selected creature is valid
+- range rules pass
+- prefix/private rules pass
+- hostile rules pass if target is hostile
 
-## 4. Optional prefix support
+## 4. Public NPC chat
 
-Current config:
+When:
 
 ```ini
 NpcChat.RequirePrefix = 0
-NpcChat.Prefix = !
 ```
 
-If prefix mode is enabled, the module only reacts when the message begins with the configured prefix.
+a player can target an NPC and speak normally:
+
+```text
+Hello there.
+```
+
+The NPC replies publicly through normal speech.
+
+## 5. Private NPC chat
+
+Private NPC chat uses:
+
+```text
+!p message
+```
 
 Examples:
 
 ```text
-!Hello there.
-!What do you know about this place?
+!p I need to ask you something privately.
+!p: Keep your voice down.
+!P This should still work.
 ```
 
-## 5. Dot-command ignore
+This forces a targeted/private reply.
 
-The module ignores messages beginning with `.` so GM commands and server commands are not sent to the LLM.
+## 6. Optional prefix mode
 
-Examples ignored:
+Prefix mode can require normal NPC chat to begin with a configured prefix:
+
+```ini
+NpcChat.RequirePrefix = 1
+NpcChat.Prefix = !
+```
+
+Then:
 
 ```text
-.tele stormwind
-.npc info
-.debug something
+!Hello there.
 ```
 
-## 6. NPC identity capture
+triggers public NPC chat.
 
-The module captures and injects NPC identity details such as:
+Private `!p` is checked first and works independently.
+
+## 7. NPC identity capture
+
+The module captures target information such as:
 
 - name
-- subname
-- entry ID
+- creature entry
+- subname/title
 - level
 - gender
 - creature type
 - rank
-- role from NPC flags
+- NPC flags / role
 - zone
-- relationship stance to player
+- friendly/neutral/hostile stance
+- combat state when relevant
 
-This allows the prompt to know whether the NPC is a merchant, trainer, innkeeper, quest giver, elite creature, enemy, stranger, or friend.
+This data is injected into prompts so the LLM does not have to guess from the name alone.
 
-## 7. Shared NPC history
+## 8. Shared history
 
-Shared history is one file per NPC entry/name.
+Shared NPC history is stored per NPC key.
 
 Example:
 
@@ -149,11 +186,11 @@ Example:
 AI_RP/npc_history/shared/Hogger_448.history
 ```
 
-This is intended to represent what the NPC has recently heard or said with adventurers in general.
+This represents the public conversational memory of that NPC.
 
-## 8. Personal player/NPC history
+## 9. Personal history
 
-Personal history is one file per player/NPC relationship.
+Personal history is stored per player/NPC pair.
 
 Example:
 
@@ -161,11 +198,11 @@ Example:
 AI_RP/npc_history/personal/Nick_123456789/Hogger_448.history
 ```
 
-This lets the same NPC remember one player differently from another.
+This lets an NPC remember one player differently from another.
 
-## 9. Configurable history tail
+## 10. History limits
 
-Current config:
+The module only loads tail sections of history files.
 
 ```ini
 NpcChat.HistoryMaxLines = 20
@@ -173,436 +210,327 @@ NpcChat.SharedHistoryMaxLines = 12
 NpcChat.PersonalHistoryMaxLines = 20
 ```
 
-The module loads only the tail of each history file to keep prompts short and avoid uncontrolled context growth.
+This keeps prompt size controlled.
 
-## 10. Name plus entry history naming
+## 11. Default prompt
 
-Current config:
-
-```ini
-NpcChat.NameByEntry = 1
-```
-
-When enabled, history files use both name and entry ID.
-
-Example:
-
-```text
-Marshal_Dughan_240.history
-```
-
-This helps avoid collisions between NPCs with the same name.
-
-## Planned features
-
-# 1. Editable default prompt
-
-Add:
+Global behavior lives in:
 
 ```text
 AI_RP/npc_history/default.prompt
 ```
 
-This file should contain global NPC behavior rules.
-
-The module should create it automatically if missing.
-
-Example default prompt:
+Use this for universal rules such as:
 
 ```text
-Stay fully in character as this NPC in Azeroth.
-Do not mention AI, prompts, files, scripts, players, servers, or game mechanics.
-Use short spoken dialogue suitable for an in-game NPC.
-No narration, no asterisks, no out-of-character text.
-Remember prior conversations naturally.
+Stay in character.
+Do not mention AI, prompts, files, or game systems.
+Use short spoken dialogue.
+No narration unless explicitly appropriate.
 ```
 
-Goal: change global NPC behavior without recompiling.
+## 12. Shared NPC prompts
 
-# 2. Shared NPC prompt files
-
-Add optional shared NPC prompt files:
-
-```text
-AI_RP/npc_history/shared/NPCName_Entry.prompt
-```
+Shared NPC prompts are public character cards for specific NPCs.
 
 Example:
 
 ```text
-AI_RP/npc_history/shared/Hogger_448.prompt
+AI_RP/npc_history/shared/Edwin_VanCleef_639.prompt
 ```
 
-This prompt should apply to that NPC for everyone.
+Use shared prompts for unique named NPC identity.
 
-Use case:
+## 13. Personal NPC prompts
 
-```text
-Hogger is territorial, brutish, angry, and suspicious. He respects strength and fears organized Stormwind patrols.
-```
-
-# 3. Personal NPC prompt files
-
-Add optional personal player/NPC prompt files:
-
-```text
-AI_RP/npc_history/personal/PlayerName_PlayerGuid/NPCName_Entry.prompt
-```
+Personal prompts apply only to one player's relationship with one NPC.
 
 Example:
 
 ```text
-AI_RP/npc_history/personal/Nick_123456789/Hogger_448.prompt
+AI_RP/npc_history/personal/Nick_123456789/Edwin_VanCleef_639.prompt
 ```
 
-This prompt applies only when that player speaks to that NPC.
+Use personal prompts for relationship-specific context.
 
-Use case:
+## 14. Sub-prompt archetypes
+
+Sub-prompts are reusable prompt blocks.
+
+Example files:
 
 ```text
-Hogger remembers Nick as the rogue who spared him once. He is still hostile, but curious.
+AI_RP/npc_history/subprompts/human.prompt
+AI_RP/npc_history/subprompts/defias_bandit.prompt
+AI_RP/npc_history/subprompts/innkeeper.prompt
+AI_RP/npc_history/subprompts/hostile_parley.prompt
 ```
 
-# 4. Prompt priority
+They work like prompt LEGO bricks.
 
-Final prompt assembly should follow this order:
+## 15. Shared sub-prompt attachments
+
+Shared attachments apply to an NPC for everyone.
+
+Example file:
 
 ```text
-1. hardcoded module identity wrapper
-2. default.prompt
-3. shared NPC prompt
-4. personal NPC prompt
-5. shared NPC history
-6. personal NPC history
-7. current player message
+AI_RP/npc_history/shared/Edwin_VanCleef_639.subprompts
 ```
 
-The hardcoded C++ wrapper should stay small and factual.
+Example contents:
 
-The editable files should control style and behavior.
+```text
+human
+defias_bandit
+hostile_parley
+war_weary
+boastful
+```
 
-# 5. `.npcc` command namespace
+## 16. Personal sub-prompt attachments
 
-Use:
+Personal attachments apply only to one player's version of an NPC.
+
+Example:
+
+```text
+AI_RP/npc_history/personal/Nick_123456789/Edwin_VanCleef_639.subprompts
+```
+
+## 17. In-game `.npcc` command system
+
+The module uses:
 
 ```text
 .npcc
 ```
 
-instead of `.npc`.
+The extra `c` means NPC Chat and avoids colliding with `.npc`.
 
-Reason:
-
-- `.npc` may already be used by core GM commands
-- `.npcc` clearly means NPC Chat
-- easy to remember
-- low collision risk
-
-# 6. `.npcc reload`
-
-Planned:
+Implemented commands include:
 
 ```text
+.npcc help
 .npcc reload
-```
-
-Should reload:
-
-- module config
-- default prompt
-- shared prompt files
-- personal prompt files, if caching is used
-
-If prompt files are loaded live on every request, this command can still recreate folders and reload config.
-
-# 7. `.npcc reset`
-
-Planned:
-
-```text
+.npcc account
 .npcc reset
+.npcc prompt
+.npcc gen
+.npcc sub
 ```
 
-Normal player behavior:
-
-- requires targeted NPC
-- deletes or truncates only that player’s personal history with that NPC
-
-GM behavior:
-
-- if GM targets an NPC, reset shared history for that NPC
-- reset all personal histories for that NPC
-
-This allows normal users to reset their own RP relationship without damaging global NPC state.
-
-# 8. `.npcc reset all`
-
-Planned GM-only command:
-
-```text
-.npcc reset all
-```
-
-Behavior:
-
-- wipe all shared NPC histories
-- wipe all personal NPC histories
-- preserve prompt files unless a separate destructive option is added
-
-This should be explicit and protected.
-
-# 9. `.npcc prompt`
-
-Planned personal prompt command:
+## 18. Prompt commands
 
 ```text
 .npcc prompt
-```
-
-With targeted NPC:
-
-- creates a blank personal prompt file if it does not exist
-- tells the player the file path
-
-Example created path:
-
-```text
-AI_RP/npc_history/personal/Nick_123456789/Hogger_448.prompt
-```
-
-# 10. `.npcc prompt "text"`
-
-Planned:
-
-```text
-.npcc prompt "This NPC remembers me as helpful but annoying."
-```
-
-Behavior:
-
-- requires targeted NPC
-- writes the quoted text into the player’s personal prompt file for that NPC
-- creates folders as needed
-
-# 11. `.npcc prompt shared`
-
-Planned GM-focused command:
-
-```text
+.npcc prompt "personal prompt text"
 .npcc prompt shared
-.npcc prompt shared "Shared prompt text here."
+.npcc prompt shared "shared prompt text"
+.npcc prompt default
+.npcc prompt default "default prompt text"
 ```
 
-Behavior:
+Normal users can manage personal prompts.
 
-- requires targeted NPC
-- creates or writes shared prompt file
-- affects all players speaking to that NPC
+Shared/default prompt management is intended for GMs.
 
-# 12. `.npcc prompt default`
-
-Planned GM-focused command:
+## 19. Sub-prompt commands
 
 ```text
-.npcc prompt default
-.npcc prompt default "Default global NPC prompt here."
+.npcc sub list
+.npcc sub show
+.npcc sub create <name> [quoted prompt text]
+.npcc sub attach <name>
+.npcc sub attach personal <name>
+.npcc sub attach shared <name>
+.npcc sub detach <name>
+.npcc sub detach personal <name>
+.npcc sub detach shared <name>
+.npcc sub clear
+.npcc sub clear personal
+.npcc sub clear shared
 ```
 
-Behavior:
+## 20. Trusted creator account allowlist
 
-- creates or writes `default.prompt`
-- affects all NPCs unless overridden by more specific prompt files
+Trusted non-GM accounts can create reusable sub-prompts and manage shared sub-prompt attachments.
 
-# 13. Hostile NPC parley mode
+Config:
 
-Hostile NPCs need special handling.
+```ini
+NpcChat.SubPromptCreatorAccounts = 1,7,42
+```
 
-Current close-range chat does not work well for enemies because the player may aggro before they can talk. Normal `/say` replies may also not be visible from safe distance.
+Aliases:
 
-Planned config:
+```ini
+NpcChat.SubPromptCreatorAccountIds = 1,7,42
+NpcChat.SubPromptCreatorAccountIDs = 1,7,42
+```
+
+Check status in game:
+
+```text
+.npcc account
+```
+
+Expected output includes account ID, GM state, creator status, and loaded allowlist.
+
+## 21. AI-generated character prompts
+
+The module can generate character prompts for the targeted NPC.
+
+Commands:
+
+```text
+.npcc gen preview [quoted extra direction]
+.npcc gen shared [quoted extra direction]
+.npcc gen personal [quoted extra direction]
+```
+
+Preview saves a `.prompt.preview` file.
+
+Shared saves:
+
+```text
+AI_RP/npc_history/shared/NPCName_Entry.prompt
+```
+
+Personal saves:
+
+```text
+AI_RP/npc_history/personal/PlayerName_PlayerGuid/NPCName_Entry.prompt
+```
+
+The generator is useful for named bosses and important NPCs.
+
+## 22. Prompt generation context
+
+Prompt generation captures:
+
+- NPC name
+- entry
+- subname/title
+- level
+- gender
+- creature type
+- rank
+- NPC flags / role
+- zone
+- hostile/friendly stance
+- combat state
+- NPC health percent
+- player health percent
+- attached shared sub-prompts
+- existing shared prompt if present
+- extra direction from the player
+
+The generator is instructed to create reusable character prompt text, not direct dialogue.
+
+## 23. Hostile parley
+
+Hostile NPC chat can work at long range:
 
 ```ini
 NpcChat.AllowHostileChat = 1
-NpcChat.FriendlyMaxDistance = 20.0
-NpcChat.HostileMinDistance = 30.0
 NpcChat.HostileMaxDistance = 100.0
-NpcChat.HostileForcePrivateReply = 1
 ```
 
-Planned behavior:
+This supports tense pre-combat exchanges.
 
-```text
-friendly/neutral NPC:
-  use normal trigger range
+## 24. Hostile close-range chat
 
-hostile NPC:
-  player must be outside minimum hostile distance
-  player must be inside maximum hostile distance
-  reply is forced private/targeted so the player can receive it
-```
-
-Prompt addition for hostiles:
-
-```text
-This NPC is hostile to the player. Treat this as a tense shouted exchange before combat. The NPC may threaten, mock, bargain, warn, or refuse to answer. Do not become friendly unless a prompt or history strongly justifies it.
-```
-
-# 14. Private reply mode
-
-Planned syntax:
-
-```text
-![p] message here
-```
-
-or config-driven equivalent.
-
-Private reply should make the NPC response visible to only the speaking player, useful for:
-
-- hostile long-distance chat
-- secretive NPCs
-- stealth/rogue-style conversations
-- testing
-
-# 15. Quest context injection
-
-Planned future feature:
-
-When talking to an NPC, optionally inspect whether the NPC starts or ends quests.
-
-Possible tables:
-
-```text
-creature_queststarter
-creature_questender
-quest_template
-quest_request_items
-quest_offer_reward
-creature_template
-gameobject_template
-item_template
-```
-
-The module should prioritize:
-
-- quests the player currently has
-- quests the player can complete
-- quests the NPC starts
-- quests the NPC ends
-- level-appropriate quests
-
-Suggested config:
+Hostile NPCs can also answer at close range:
 
 ```ini
-NpcChat.EnableQuestContext = 1
-NpcChat.QuestContextMaxQuests = 4
-NpcChat.QuestContextIncludeObjectives = 1
-NpcChat.QuestContextIncludeRewardText = 1
+NpcChat.HostileAllowCloseChat = 1
 ```
 
-Prompt rule:
+When disabled, the old `HostileMinDistance` parley behavior applies.
+
+## 25. Hostile combat talk
+
+Hostile NPCs can answer during combat:
+
+```ini
+NpcChat.HostileAllowCombatChat = 1
+```
+
+The module captures fight context and prompts the NPC to react naturally.
+
+## 26. Hostile private/public behavior
+
+Config:
+
+```ini
+NpcChat.HostileForcePrivateReply = 0
+```
+
+If this is `1`, hostile replies are always private.
+
+If this is `0`, close hostile replies can be public, while far hostile replies are still forced private so the player can see them at distance.
+
+## 27. Combat context
+
+For hostile NPCs, the prompt can include:
 
 ```text
-Use quest context only when relevant. Do not force every reply to become quest dialogue.
+Distance from speaker
+NPC health percent
+Player health percent
+NPC in combat: yes/no
+Player in combat: yes/no
+NPC directly targeting speaker: yes/no
+Fight read: NPC winning / player winning / close fight
 ```
 
-# 16. Gossip/vendor/trainer context
+The prompt instructs the LLM not to say exact health percentages unless directly asked.
 
-Possible future context:
+## 28. File-backed design
 
-- vendor inventory category
-- trainer type
-- innkeeper status
-- flight master destination flavor
-- banker/auctioneer professionalism
-- stable master pet talk
-- battlemaster faction pride
+Prompt text and bindings are currently file-backed.
 
-This should be summarized, not dumped raw.
+Advantages:
 
-# 17. Cooldowns and anti-spam
+- easy to edit
+- easy to Git
+- easy to back up
+- easy to copy to another server
+- avoids SQL escaping for long prompt text
+- good for small private servers
 
-Planned config:
+Possible future improvement:
 
-```ini
-NpcChat.PlayerCooldownMs = 3000
-NpcChat.NpcCooldownMs = 5000
-NpcChat.MaxPendingRequestsPerPlayer = 1
-NpcChat.MaxGlobalPendingRequests = 10
-```
+- keep prompt text in files
+- store NPC-to-subprompt bindings in database
+- add command-driven suggestion and indexing features
 
-Goals:
+## 29. Suggested future features
 
-- prevent accidental API spam
-- prevent multiple detached workers flooding the server
-- avoid double-triggering from fast chat
-- protect API credit usage
+Potential future improvements:
 
-# 18. History management
+- `.npcc key` to print exact NPC key and file paths
+- `.npcc suggest` to suggest sub-prompts based on target NPC data
+- `.npcc suggest apply` for trusted users
+- in-memory prompt cache refreshed by `.npcc reload`
+- database-backed shared/personal sub-prompt bindings
+- web/admin UI for prompt review
+- bulk character prompt generation tools
+- automatic prompt linting
+- model fallback configuration
+- per-zone default prompt overlays
+- per-faction default prompt overlays
+- cooldown controls for hostile combat talk
+- optional automatic rare boss barks
 
-Planned:
+## 30. Known limitations
 
-- truncate histories after a configurable size
-- optional archive instead of delete
-- `.npcc reset` command support
-- optional summaries for long-term memory
-
-Potential config:
-
-```ini
-NpcChat.HistoryMaxFileLines = 200
-NpcChat.HistoryArchiveOnReset = 1
-NpcChat.HistorySummarize = 0
-```
-
-# 19. Debugging tools
-
-Planned:
-
-```ini
-NpcChat.Debug = 0
-NpcChat.DebugShowPrompt = 0
-NpcChat.DebugShowPaths = 0
-NpcChat.DebugShowApiErrors = 1
-```
-
-Helpful GM commands:
-
-```text
-.npcc info
-.npcc paths
-.npcc showprompt
-```
-
-These should be GM-only if they expose prompt contents or file paths.
-
-# 20. Integration ideas
-
-Potential integrations:
-
-- mod-playerbots-characters
-- playerbot party context
-- dungeon/raid boss RP
-- progression phase awareness
-- zone event awareness
-- web UI prompt editor
-- account-level character relationship view
-
-## Non-goals
-
-This module should not:
-
-- control NPC combat AI
-- replace gossip menus
-- replace quest text
-- call LLMs for every ambient NPC event
-- allow bots to generate unlimited API calls
-- touch live game objects off-thread
-- require a web service to run the worldserver
-- commit private API keys or player histories to Git
-
-## Development credit
-
-This project is being developed through a human-directed AI-assisted workflow.
-
-Primary project direction, testing, server integration, and design decisions are maintained by the server owner. Code, documentation, and architecture have been developed mainly through iterative collaboration with GPT and Claude.
+- Experimental code.
+- LLM calls depend on external API availability.
+- Prompt generation can be wrong and should be reviewed.
+- File-backed attachments are simple but not ideal for large public realms.
+- No automatic sub-prompt suggestion yet.
+- No database binding table yet.
+- Combat talk is player-triggered, not automatic fight spam.
+- Private response behavior depends on supported chat packet/function behavior in the target core.
