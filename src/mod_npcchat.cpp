@@ -1648,13 +1648,13 @@ private:
             if (CreatureTemplate const* ct = npc->GetCreatureTemplate())
             {
                 req.npcSubName = ct->SubName;
-                req.gender = GenderStr(ct->gender);
                 req.creatureType = CreatureTypeStr(ct->type);
                 req.rankStr = RankStr(ct->rank);
                 req.roleStr = RolesFromNpcFlags(ct->npcflag);
             }
 
             req.npcLevel = npc->GetLevel();
+            req.gender = GenderStr(npc->getGender());
             req.isHostile = npc->IsHostileTo(player);
             req.npcInCombat = npc->IsInCombat();
             req.playerInCombat = player->IsInCombat();
