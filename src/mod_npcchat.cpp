@@ -59,6 +59,9 @@ namespace
     int         g_TimeoutSec = 30;
     std::string g_ExtraParams;
 
+    int         g_GeneratePromptMaxTokens = 700;
+    double      g_GeneratePromptTemperature = 0.75;
+
     std::string g_HistoryPath = "./AI_RP/npc_history";
     int         g_HistoryTail = 20;          // legacy/default tail if new split values are absent
     int         g_SharedHistoryTail = 12;    // shared NPC memory lines fed to model
@@ -125,6 +128,8 @@ namespace
         g_Temperature = sConfigMgr->GetOption<float>("NpcChat.Temperature", 0.85f);
         g_TimeoutSec = sConfigMgr->GetOption<int32>("NpcChat.RequestTimeoutSec", 30);
         g_ExtraParams = sConfigMgr->GetOption<std::string>("NpcChat.ModelExtraParameters", "");
+        g_GeneratePromptMaxTokens = sConfigMgr->GetOption<int32>("NpcChat.GeneratePromptMaxTokens", 700);
+        g_GeneratePromptTemperature = sConfigMgr->GetOption<float>("NpcChat.GeneratePromptTemperature", 0.75f);
 
         g_HistoryPath = sConfigMgr->GetOption<std::string>("NpcChat.HistoryPath", "./AI_RP/npc_history");
         g_HistoryTail = sConfigMgr->GetOption<int32>("NpcChat.HistoryMaxLines", 20);
@@ -208,8 +213,46 @@ namespace
         bool        forcePrivateReply = false;
     };
 
+    struct SystemMessage
+    {
+        uint64_t    playerGuidRaw = 0;
+        std::string text;
+    };
+
+    struct GenPromptRequest
+    {
+        uint64_t    playerGuidRaw = 0;
+        uint64_t    npcGuidRaw = 0;
+        uint32_t    npcEntry = 0;
+
+        std::string playerName;
+        std::string npcName;
+        std::string npcSubName;
+        uint32_t    npcLevel = 0;
+        std::string gender;
+        std::string creatureType;
+        std::string rankStr;
+        std::string roleStr;
+        std::string stance;
+        std::string zoneName;
+        bool        isHostile = false;
+        bool        npcInCombat = false;
+        bool        playerInCombat = false;
+        bool        npcTargetingPlayer = false;
+        float       npcHealthPct = 100.0f;
+        float       playerHealthPct = 100.0f;
+        float       distance = 0.0f;
+        std::string fightState;
+
+        std::string mode;             // shared, personal, preview
+        std::string extraInstruction;
+        std::string outputPath;
+    };
+
     std::queue<ChatReply> g_ReplyQueue;
     std::mutex            g_ReplyMutex;
+    std::queue<SystemMessage> g_SystemMessageQueue;
+    std::mutex            g_SystemMessageMutex;
 
     // One global lock for all NPC history file IO. Good enough for a small
     // personal realm; prevents two workers from interleaving the same file.
@@ -684,6 +727,16 @@ namespace
         if (f.is_open())
             f << line << "\n";
     }
+
+    void QueueSystemMessage(uint64_t playerGuidRaw, std::string text)
+    {
+        SystemMessage msg;
+        msg.playerGuidRaw = playerGuidRaw;
+        msg.text = std::move(text);
+
+        std::lock_guard<std::mutex> lock(g_SystemMessageMutex);
+        g_SystemMessageQueue.push(std::move(msg));
+    }
 }
 
 // ===========================================================================
@@ -891,6 +944,163 @@ namespace
 
         return ss.str();
     }
+}
+
+std::string BuildGenerateCharacterSystemPrompt(GenPromptRequest const& req)
+{
+    std::ostringstream ss;
+    ss << "You are creating a reusable character prompt for a World of Warcraft non-playable character.";
+    ss << " The prompt will be used by an NPC chat roleplay module as the shared or personal identity layer for that specific NPC.";
+    ss << " Output ONLY the prompt text to save. Do not use markdown. Do not include headings. Do not include quotes around the answer.";
+    ss << " Do not mention AI, LLMs, files, commands, players, prompts, or game mechanics.";
+    ss << " Do not write sample dialogue. Write the NPC's identity, motives, worldview, speech style, loyalties, grudges, boundaries, and combat attitude.";
+    ss << " Keep it lore-grounded, vivid, and concise enough to reuse during live chat.";
+
+    if (req.mode == "personal")
+        ss << " This is a personal relationship prompt for how this NPC specifically regards the named player; keep it compatible with the public identity.";
+    else
+        ss << " This is a shared public character prompt for everyone who talks to this NPC.";
+
+    return ss.str();
+}
+
+std::string BuildGenerateCharacterUserPrompt(GenPromptRequest const& req,
+    std::vector<std::string> const& sharedSubPromptNames,
+    std::string const& sharedSubPrompts,
+    std::string const& existingSharedPrompt,
+    std::string const& existingPersonalPrompt)
+{
+    std::ostringstream ss;
+
+    ss << "NPC facts:\n";
+    ss << "- Name: " << req.npcName << "\n";
+    ss << "- Entry ID: " << req.npcEntry << "\n";
+    if (!req.npcSubName.empty())
+        ss << "- Subname/title: " << req.npcSubName << "\n";
+    if (req.npcLevel)
+        ss << "- Level: " << req.npcLevel << "\n";
+    if (!req.gender.empty())
+        ss << "- Gender: " << req.gender << "\n";
+    if (!req.creatureType.empty())
+        ss << "- Creature type: " << req.creatureType << "\n";
+    if (!req.rankStr.empty())
+        ss << "- Rank: " << req.rankStr << "\n";
+    if (!req.roleStr.empty())
+        ss << "- NPC role flags: " << req.roleStr << "\n";
+    if (!req.zoneName.empty())
+        ss << "- Current zone: " << req.zoneName << "\n";
+    if (!req.stance.empty())
+        ss << "- Current reaction to player: " << req.stance << "\n";
+    if (req.isHostile)
+        ss << "- Hostile to the player: yes\n";
+    if (req.npcInCombat || req.playerInCombat)
+    {
+        ss << "- Combat context: " << req.fightState << "\n";
+        ss << "- NPC health now: about " << req.npcHealthPct << "%\n";
+        ss << "- Speaker health now: about " << req.playerHealthPct << "%\n";
+    }
+
+    if (!sharedSubPromptNames.empty())
+        ss << "\nAttached shared subprompt names: " << JoinNames(sharedSubPromptNames) << "\n";
+
+    if (!sharedSubPrompts.empty())
+    {
+        ss << "\nAttached shared subprompt contents for context:\n";
+        ss << sharedSubPrompts << "\n";
+    }
+
+    if (!existingSharedPrompt.empty())
+    {
+        ss << "\nExisting shared prompt, if improving/replacing it:\n";
+        ss << existingSharedPrompt << "\n";
+    }
+
+    if (req.mode == "personal" && !existingPersonalPrompt.empty())
+    {
+        ss << "\nExisting personal prompt, if improving/replacing it:\n";
+        ss << existingPersonalPrompt << "\n";
+    }
+
+    if (!req.extraInstruction.empty())
+    {
+        ss << "\nExtra direction from the player:\n";
+        ss << req.extraInstruction << "\n";
+    }
+
+    ss << "\nWrite the final " << (req.mode == "personal" ? "personal relationship" : "shared character") << " prompt now.";
+    ss << " Make it specific to " << req.npcName << ", not a generic archetype.";
+    ss << " Aim for 180-450 words unless the extra direction requires less.";
+
+    return ss.str();
+}
+
+void GeneratePromptWorker(GenPromptRequest req)
+{
+    std::vector<std::string> sharedSubPromptNames;
+    std::string sharedSubPrompts;
+    std::string existingSharedPrompt;
+    std::string existingPersonalPrompt;
+
+    {
+        std::lock_guard<std::mutex> lock(g_FileMutex);
+        EnsureNpcChatDirectoriesAndDefaultPrompt();
+
+        sharedSubPromptNames = LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry));
+        sharedSubPrompts = LoadSubPromptBlocks(sharedSubPromptNames);
+        existingSharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
+        existingPersonalPrompt = ReadWholeTextFile(req.outputPath);
+    }
+
+    NpcChat_ApiConfig cfg;
+    cfg.baseUrl = g_BaseUrl;
+    cfg.apiKey = g_ApiKey;
+    cfg.model = g_Model;
+    cfg.maxTokens = g_GeneratePromptMaxTokens;
+    cfg.temperature = g_GeneratePromptTemperature;
+    cfg.timeoutSec = g_TimeoutSec;
+    cfg.extraParams = g_ExtraParams;
+
+    NpcChat_LLMResult res = NpcChat_CallLLM(
+        cfg,
+        BuildGenerateCharacterSystemPrompt(req),
+        BuildGenerateCharacterUserPrompt(req, sharedSubPromptNames, sharedSubPrompts, existingSharedPrompt, existingPersonalPrompt));
+
+    if (!res.success || TrimCopy(res.text).empty())
+    {
+        QueueSystemMessage(req.playerGuidRaw, "NPC Chat prompt generation failed or returned empty text.");
+        return;
+    }
+
+    std::string generated = TrimCopy(res.text);
+
+    if (generated.rfind("```", 0) == 0)
+    {
+        size_t firstNl = generated.find('\n');
+        size_t lastFence = generated.rfind("```");
+        if (firstNl != std::string::npos && lastFence != std::string::npos && lastFence > firstNl)
+            generated = TrimCopy(generated.substr(firstNl + 1, lastFence - firstNl - 1));
+    }
+
+    std::string savedPath = req.outputPath;
+    if (req.mode == "preview")
+        savedPath = SharedPromptFilePath(req.npcName, req.npcEntry) + ".preview";
+
+    {
+        std::lock_guard<std::mutex> lock(g_FileMutex);
+        EnsureNpcChatDirectoriesAndDefaultPrompt();
+        if (!WriteWholeTextFile(savedPath, generated, true))
+        {
+            QueueSystemMessage(req.playerGuidRaw, "NPC Chat generated the prompt but failed to save the file.");
+            return;
+        }
+    }
+
+    std::ostringstream done;
+    if (req.mode == "preview")
+        done << "NPC Chat generated preview prompt saved: " << savedPath;
+    else
+        done << "NPC Chat generated " << req.mode << " prompt saved: " << savedPath;
+    QueueSystemMessage(req.playerGuidRaw, done.str());
 }
 
 // ===========================================================================
@@ -1153,12 +1363,29 @@ public:
         if (!g_Enable)
             return;
 
+        std::queue<SystemMessage> localSystem;
+        {
+            std::lock_guard<std::mutex> lock(g_SystemMessageMutex);
+            std::swap(localSystem, g_SystemMessageQueue);
+        }
+
+        while (!localSystem.empty())
+        {
+            SystemMessage& m = localSystem.front();
+            if (Player* player = ObjectAccessor::FindPlayer(ObjectGuid(m.playerGuidRaw)))
+            {
+                if (player->IsInWorld() && player->GetSession())
+                {
+                    ChatHandler chat(player->GetSession());
+                    chat.PSendSysMessage("{}", m.text);
+                }
+            }
+            localSystem.pop();
+        }
+
         std::queue<ChatReply> local;
         {
             std::lock_guard<std::mutex> lock(g_ReplyMutex);
-            if (g_ReplyQueue.empty())
-                return;
-
             std::swap(local, g_ReplyQueue);
         }
 
@@ -1292,6 +1519,9 @@ private:
             handler->PSendSysMessage(".npcc reload");
             handler->PSendSysMessage(".npcc reset");
             handler->PSendSysMessage(".npcc prompt [quoted personal prompt]");
+            handler->PSendSysMessage(".npcc gen shared [quoted extra direction]");
+            handler->PSendSysMessage(".npcc gen personal [quoted extra direction]");
+            handler->PSendSysMessage(".npcc gen preview [quoted extra direction]");
             handler->PSendSysMessage(".npcc sub list");
             handler->PSendSysMessage(".npcc sub show");
             handler->PSendSysMessage(".npcc sub attach <name>");
@@ -1360,6 +1590,101 @@ private:
                     "No personal NPC Chat history existed for this NPC.");
             }
 
+            return true;
+        }
+
+        if (StartsWithWord(arg, "gen", rest) || StartsWithWord(arg, "generate", rest))
+        {
+            Player* player = GetCommandPlayer(handler);
+            if (!player)
+            {
+                handler->PSendSysMessage("This command must be used in game.");
+                return true;
+            }
+
+            Creature* npc = GetSelectedCreature(handler);
+            if (!npc)
+            {
+                handler->PSendSysMessage("Target an NPC first.");
+                return true;
+            }
+
+            std::string mode = "preview";
+            std::string extra = rest;
+            std::string maybeRest;
+
+            if (StartsWithWord(rest, "shared", maybeRest))
+            {
+                mode = "shared";
+                extra = maybeRest;
+            }
+            else if (StartsWithWord(rest, "personal", maybeRest))
+            {
+                mode = "personal";
+                extra = maybeRest;
+            }
+            else if (StartsWithWord(rest, "preview", maybeRest))
+            {
+                mode = "preview";
+                extra = maybeRest;
+            }
+
+            if (mode == "shared" && !CanManageSharedSubPrompts(handler))
+            {
+                handler->PSendSysMessage("Only GMs or configured NPC Chat sub-prompt creator accounts may generate shared NPC prompts.");
+                handler->PSendSysMessage("Use .npcc account to see your account ID and loaded allowlist.");
+                return true;
+            }
+
+            extra = StripWrappingQuotes(TrimCopy(extra));
+
+            GenPromptRequest req;
+            req.playerGuidRaw = player->GetGUID().GetRawValue();
+            req.npcGuidRaw = npc->GetGUID().GetRawValue();
+            req.npcEntry = npc->GetEntry();
+            req.playerName = player->GetName();
+            req.npcName = npc->GetName();
+
+            if (CreatureTemplate const* ct = npc->GetCreatureTemplate())
+            {
+                req.npcSubName = ct->SubName;
+                req.gender = GenderStr(ct->gender);
+                req.creatureType = CreatureTypeStr(ct->type);
+                req.rankStr = RankStr(ct->rank);
+                req.roleStr = RolesFromNpcFlags(ct->npcflag);
+            }
+
+            req.npcLevel = npc->GetLevel();
+            req.isHostile = npc->IsHostileTo(player);
+            req.npcInCombat = npc->IsInCombat();
+            req.playerInCombat = player->IsInCombat();
+            req.npcTargetingPlayer = npc->GetVictim() == player;
+            req.npcHealthPct = UnitHealthPct(npc);
+            req.playerHealthPct = UnitHealthPct(player);
+            req.distance = npc->GetDistance(player);
+            req.fightState = BuildFightState(req.npcHealthPct, req.playerHealthPct, req.npcInCombat, req.playerInCombat, req.npcTargetingPlayer);
+
+            if (req.isHostile)
+                req.stance = "an enemy";
+            else if (npc->IsFriendlyTo(player))
+                req.stance = "a friend";
+            else
+                req.stance = "a stranger";
+
+            if (AreaTableEntry const* zone = sAreaTableStore.LookupEntry(npc->GetZoneId()))
+                req.zoneName = zone->area_name[0];
+
+            req.mode = mode;
+            req.extraInstruction = extra;
+            if (mode == "personal")
+                req.outputPath = PersonalPromptFilePath(player->GetName(), player->GetGUID().GetRawValue(), npc->GetName(), npc->GetEntry());
+            else
+                req.outputPath = SharedPromptFilePath(npc->GetName(), npc->GetEntry());
+
+            std::thread(GeneratePromptWorker, std::move(req)).detach();
+
+            handler->PSendSysMessage("NPC Chat character prompt generation started for {} ({}).", npc->GetName(), mode.c_str());
+            handler->PSendSysMessage("You will get a system message when the file is saved.");
             return true;
         }
 

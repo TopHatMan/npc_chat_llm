@@ -112,7 +112,12 @@ NpcChat.HostileForcePrivateReply = 0
 NpcChat.RequirePrefix = 0
 NpcChat.Prefix = 
 
+###################################################################################################
+# NPC Chat LLM - AI character prompt generator
+###################################################################################################
 
+NpcChat.GeneratePromptMaxTokens = 700
+NpcChat.GeneratePromptTemperature = 0.75
 # --------------------------------------------
 # TRIGGER
 # --------------------------------------------
