@@ -1,144 +1,157 @@
-[worldserver]
-
-########################################
-# mod-npc-chat configuration
-########################################
-#
-# Talk to any targeted world NPC and get an AI reply in a chat bubble.
-# Target a creature, /say something within range, and it answers in character.
-# Each NPC keeps a flat .history file of its conversations.
-
-# NpcChat.Enable
-#     Enable (1) or disable (0) the module.
-#     Default: 0
-NpcChat.Enable = 1
-
-# --------------------------------------------
-# API CONNECTION (OpenAI-compatible)
-# --------------------------------------------
-
-# NpcChat.BaseUrl
-#     Base URL of the LLM API. "/chat/completions" is appended automatically.
-#     Default: https://openrouter.ai/api/v1
-NpcChat.BaseUrl = https://openrouter.ai/api/v1
-
-# NpcChat.ApiKey
-#     Bearer token. Leave blank for a local keyless endpoint (Ollama/LM Studio).
-NpcChat.ApiKey =
-
-# NpcChat.Model
-#     Model identifier. REQUIRED.
-#     A cheap, fast model is plenty for short in-character replies.
-NpcChat.Model = google/gemini-2.5-flash-lite
-
-# NpcChat.MaxResponseTokens
-#     Cap on generated tokens. Small = short bubbles + cheaper. Default: 150
-NpcChat.MaxResponseTokens = 150
-
-# NpcChat.Temperature
-#     Sampling temperature. Default: 0.8
-NpcChat.Temperature = 0.8
-
-# NpcChat.RequestTimeoutSec
-#     HTTP timeout in seconds. Default: 30
-NpcChat.RequestTimeoutSec = 30
-
-# NpcChat.ModelExtraParameters
-#     Raw JSON fragment merged into every request body. Single quotes are
-#     converted to double quotes at runtime. Use this to disable reasoning on
-#     models that bill thinking tokens.
-#     Example: 'reasoning_effort':'low'
-#     Example: 'thinking':{'type':'disabled'}
-NpcChat.ModelExtraParameters =
-
-# --------------------------------------------
-# CONVERSATION / HISTORY
-# --------------------------------------------
-
-# NpcChat.HistoryPath
-#     Directory for per-NPC .history files (created if missing).
-#     Relative to the server working directory.
-NpcChat.HistoryPath = ./AI_RP/npc_history
-
-# NpcChat.HistoryMaxLines
-#     How many recent conversation lines are sent back to the model as context.
-#     This is the main cost dial — keep it modest. Default: 20  (~10 exchanges)
-NpcChat.HistoryMaxLines = 20
-
-# NpcChat.NameByEntry
-#     1 = file per NPC type, e.g. Hogger_448.history (avoids same-name collisions).
-#     0 = original behaviour: one file per name, e.g. Hogger.history
-#         (every "Stormwind Guard" then shares a single log).
-#     Default: 1
-NpcChat.NameByEntry = 1
-
-# ------------------------------------------------------------
-# mod-npc-chat-llm prompt/history + hostile parley settings
-# ------------------------------------------------------------
-
-# Root NPC chat folder. Module will create:
-#   default.prompt
-#   shared/
-#   personal/
-NpcChat.HistoryPath = ./AI_RP/npc_history
-
-# Friendly/neutral NPC normal chat range.
-NpcChat.TriggerRange = 25.0
+###################################################################################################
+# NPC Chat LLM - current combined feature config
+# Safe defaults: all proximity/automatic bark systems are OFF.
+# Manual .npcc commands still work when NpcChat.Enable = 1.
+###################################################################################################
 
 ###################################################################################################
-# NPC Chat LLM - Hostile close/far and combat talk
+# Main live NPC chat model
+###################################################################################################
+
+NpcChat.Enable = 1
+NpcChat.BaseUrl =
+NpcChat.ApiKey =
+NpcChat.Model =
+NpcChat.MaxResponseTokens = 180
+NpcChat.Temperature = 0.85
+NpcChat.RequestTimeoutSec = 30
+NpcChat.ModelExtraParameters =
+
+NpcChat.HistoryPath = ./AI_RP/npc_history
+NpcChat.HistoryMaxLines = 20
+NpcChat.SharedHistoryMaxLines = 12
+NpcChat.PersonalHistoryMaxLines = 20
+NpcChat.NameByEntry = 1
+
+NpcChat.TriggerRange = 25.0
+NpcChat.RequirePrefix = 0
+NpcChat.Prefix = !
+
+###################################################################################################
+# Advanced generation model
+# Blank values fall back to the normal NpcChat.* API/model.
+# Use this for .npcc gen shared/personal/bark/quest if you want a stronger model.
+###################################################################################################
+
+NpcChat.Generation.BaseUrl =
+NpcChat.Generation.ApiKey =
+NpcChat.Generation.Model =
+NpcChat.Generation.MaxTokens = 700
+NpcChat.Generation.Temperature = 0.75
+NpcChat.Generation.RequestTimeoutSec = 60
+NpcChat.Generation.ModelExtraParameters =
+
+# Legacy aliases still accepted by the code if present.
+NpcChat.GeneratePromptMaxTokens = 700
+NpcChat.GeneratePromptTemperature = 0.75
+
+###################################################################################################
+# Hostile NPC chat while directly spoken to
 ###################################################################################################
 
 NpcChat.AllowHostileChat = 1
-
-# Allows talking to hostile NPCs inside normal aggro/melee range.
-# If 0, HostileMinDistance is enforced like old parley-only behavior.
 NpcChat.HostileAllowCloseChat = 1
-
-# Allows talking to hostile NPCs while you or the NPC are in combat.
 NpcChat.HostileAllowCombatChat = 1
-
-# Used only when HostileAllowCloseChat = 0.
 NpcChat.HostileMinDistance = 30.0
-
-# Maximum hostile shout/talk range.
 NpcChat.HostileMaxDistance = 100.0
-
-# If 1, hostile replies are always private to the player.
-# If 0, close hostile replies can be public /say, while far hostile replies are still forced private.
 NpcChat.HostileForcePrivateReply = 0
-# Optional trigger prefix. Leave RequirePrefix = 0 if you want normal /say to work.
-# If enabled, example: NpcChat.Prefix = !
-NpcChat.RequirePrefix = 0
-NpcChat.Prefix = 
 
 ###################################################################################################
-# NPC Chat LLM - AI character prompt generator
-###################################################################################################
-
-NpcChat.GeneratePromptMaxTokens = 700
-NpcChat.GeneratePromptTemperature = 0.75
-# --------------------------------------------
-# TRIGGER
-# --------------------------------------------
-
-# NpcChat.TriggerRange
-#     Max yards between you and the targeted NPC for /say to reach it. Default: 25
-NpcChat.TriggerRange = 25
-
-# NpcChat.RequirePrefix
-#     1 = only route /say to the NPC when the message starts with NpcChat.Prefix
-#         (so normal /say is never hijacked). 0 = any /say with an NPC targeted.
-#     Default: 0
-NpcChat.RequirePrefix = 0
-
-# NpcChat.Prefix
-#     Prefix string used when RequirePrefix = 1, e.g. "@". Stripped before sending.
-NpcChat.Prefix =
-###################################################################################################
-# NPC Chat LLM - sub-prompt creator allowlist
-# Comma-separated account IDs allowed to run .npcc sub create without GM security.
-# In-game: use .npcc account to see the current account ID.
+# Trusted non-GM worldbuilder accounts
+# Put account IDs here, comma-separated.
 ###################################################################################################
 
 NpcChat.SubPromptCreatorAccounts =
+NpcChat.SubPromptCreatorAccountIds =
+NpcChat.SubPromptCreatorAccountIDs =
+
+###################################################################################################
+# Cached relationship barks
+# Uses personal .relationship and .barks files.
+# Proximity never calls the AI when GenerateMissing = 0.
+###################################################################################################
+
+NpcChat.RelationshipBarks.Enabled = 0
+NpcChat.RelationshipBarks.RealPlayersOnly = 1
+NpcChat.RelationshipBarks.TriggerDistance = 12.0
+NpcChat.RelationshipBarks.ChancePct = 8
+NpcChat.RelationshipBarks.PlayerCooldownSec = 600
+NpcChat.RelationshipBarks.NpcCooldownSec = 300
+NpcChat.RelationshipBarks.PairCooldownSec = 900
+NpcChat.RelationshipBarks.ScanIntervalMs = 2000
+NpcChat.RelationshipBarks.GenerateMissing = 0
+
+###################################################################################################
+# Cached hostile elite first-talk barks
+# Uses shared .hostile_barks files.
+# Safe first version checks selected hostile NPC only, not full nearby grid scan.
+###################################################################################################
+
+NpcChat.HostileFirstTalk.Enabled = 0
+NpcChat.HostileFirstTalk.RealPlayersOnly = 1
+NpcChat.HostileFirstTalk.TriggerDistance = 35.0
+NpcChat.HostileFirstTalk.ChancePct = 20
+NpcChat.HostileFirstTalk.PlayerCooldownSec = 900
+NpcChat.HostileFirstTalk.NpcCooldownSec = 900
+NpcChat.HostileFirstTalk.PairCooldownSec = 1800
+NpcChat.HostileFirstTalk.ScanIntervalMs = 2000
+NpcChat.HostileFirstTalk.GenerateMissing = 0
+NpcChat.HostileFirstTalk.ElitesOnly = 1
+NpcChat.HostileFirstTalk.AllowInCombat = 0
+
+###################################################################################################
+# Cached trainer barks
+# Uses shared .trainer_barks files.
+# First pass checks trainer flag. Later pass should check same class/trainable spells.
+###################################################################################################
+
+NpcChat.TrainerBarks.Enabled = 0
+NpcChat.TrainerBarks.RealPlayersOnly = 1
+NpcChat.TrainerBarks.TriggerDistance = 12.0
+NpcChat.TrainerBarks.ChancePct = 10
+NpcChat.TrainerBarks.PlayerCooldownSec = 600
+NpcChat.TrainerBarks.NpcCooldownSec = 300
+NpcChat.TrainerBarks.PairCooldownSec = 900
+NpcChat.TrainerBarks.ScanIntervalMs = 3000
+NpcChat.TrainerBarks.GenerateMissing = 0
+
+###################################################################################################
+# Cached quest barks
+# Uses npcchat_quest_bark_cache world table.
+# First pass checks selected questgiver only, not full nearby grid scan.
+# GenerateMissing = 0 means proximity never spends API tokens.
+###################################################################################################
+
+NpcChat.QuestBarks.Enabled = 0
+NpcChat.QuestBarks.RealPlayersOnly = 1
+NpcChat.QuestBarks.GenerateMissing = 0
+NpcChat.QuestBarks.TriggerDistance = 12.0
+NpcChat.QuestBarks.ChancePct = 10
+NpcChat.QuestBarks.PlayerCooldownSec = 900
+NpcChat.QuestBarks.NpcCooldownSec = 300
+NpcChat.QuestBarks.PairCooldownSec = 1800
+NpcChat.QuestBarks.ScanIntervalMs = 3000
+NpcChat.QuestBarks.MaxQuestsCheckedPerNpc = 8
+
+
+###################################################################################################
+# NPC Chat LLM - quest bark nearby scan additions
+#
+# SelectedOnly = 1 keeps old safest behavior: quest bark checks selected questgiver only.
+# SelectedOnly = 0 enables the new DB-assisted nearby questgiver scan.
+#
+# GenerateMissing = 0 means walking near a questgiver never spends API tokens unless a cached bark
+# already exists. Set GenerateMissing = 1 only after manual testing.
+###################################################################################################
+
+NpcChat.QuestBarks.Enabled = 0
+NpcChat.QuestBarks.SelectedOnly = 1
+NpcChat.QuestBarks.RealPlayersOnly = 1
+NpcChat.QuestBarks.GenerateMissing = 0
+NpcChat.QuestBarks.TriggerDistance = 12.0
+NpcChat.QuestBarks.ChancePct = 10
+NpcChat.QuestBarks.PlayerCooldownSec = 900
+NpcChat.QuestBarks.NpcCooldownSec = 300
+NpcChat.QuestBarks.PairCooldownSec = 1800
+NpcChat.QuestBarks.ScanIntervalMs = 3000
+NpcChat.QuestBarks.MaxQuestsCheckedPerNpc = 8
