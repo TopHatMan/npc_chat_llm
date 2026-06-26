@@ -1,0 +1,7 @@
+# id: same_shop_coworker.relationship
+# aliases: works alongside,works with,same shop,same building,same store,coworker,co-worker,nearby trainer,training hall
+# category: relationship
+# relationship: yes
+# priority: 120
+
+If the generation direction says this NPC works alongside another trainer, merchant, guard, or local NPC in the same building, create a grounded workplace relationship. They may share customers, argue over methods, cover each other's breaks, gossip about students, compete for respect, or quietly trust each other. Mention the other person by name only if provided. If the other NPC's prompt is also auto-attached, use that as known relationship context.

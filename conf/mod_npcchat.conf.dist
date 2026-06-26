@@ -155,3 +155,53 @@ NpcChat.QuestBarks.NpcCooldownSec = 300
 NpcChat.QuestBarks.PairCooldownSec = 1800
 NpcChat.QuestBarks.ScanIntervalMs = 3000
 NpcChat.QuestBarks.MaxQuestsCheckedPerNpc = 8
+
+###################################################################################################
+# NPC Chat LLM - Hostile first-talk SQL cache with disable table
+###################################################################################################
+
+NpcChat.HostileFirstTalk.Enabled = 1
+NpcChat.HostileFirstTalk.GenerateMissing = 1
+
+# Keep this as intro-only, not combat chatter.
+NpcChat.HostileFirstTalk.AllowInCombat = 0
+
+# Good testing values; raise cooldowns/lower chance after testing.
+NpcChat.HostileFirstTalk.ChancePct = 100
+NpcChat.HostileFirstTalk.TriggerDistance = 35.0
+NpcChat.HostileFirstTalk.ScanIntervalMs = 3000
+NpcChat.HostileFirstTalk.PlayerCooldownSec = 60
+NpcChat.HostileFirstTalk.NpcCooldownSec = 60
+NpcChat.HostileFirstTalk.PairCooldownSec = 120
+
+# Bosses/elite-only keeps it focused. Specific NPCs can also be disabled in SQL:
+# REPLACE INTO npcchat_npc_bark_disable (npc_entry,bark_context,disabled,reason)
+# VALUES (639,'hostile_first_talk',1,'Already has scripted boss dialogue');
+NpcChat.HostileFirstTalk.ElitesOnly = 1
+# NPC Chat generation lorebook / auto subprompt injection
+#
+# Folder layout:
+#   <NpcChat.HistoryPath>/default.prompt
+#   <NpcChat.HistoryPath>/personal/
+#   <NpcChat.HistoryPath>/shared/
+#   <NpcChat.HistoryPath>/subprompts/
+#
+# quest_barks is no longer needed for generated bark storage if you moved
+# quest bark cache to SQL.
+
+# Scan quoted .npcc gen direction plus copied NPC facts, then auto-attach
+# matching .prompt files from NpcChat.HistoryPath/subprompts.
+NpcChat.GenAutoSubPrompts = 1
+
+# Total auto-matched files allowed per generation.
+NpcChat.GenAutoSubPromptMaxTotal = 6
+
+# Prevent one type/category from flooding the context.
+NpcChat.GenAutoSubPromptMaxPerCategory = 2
+
+# Send a system message showing which auto-subprompts fired.
+NpcChat.GenAutoSubPromptDebug = 1
+
+# Treat *.npc.prompt and *.relationship.prompt files as relationship/world context,
+# not as identity replacement.
+NpcChat.GenAutoRelationshipPrompts = 1

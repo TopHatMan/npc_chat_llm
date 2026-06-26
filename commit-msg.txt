@@ -1,0 +1,28 @@
+Add cached NPC bark systems and nearby questgiver barks
+
+This expands mod-npc-chat-llm from basic targeted NPC chat into a broader cached world-bark system.
+
+Major additions:
+- Add shared and personal generated NPC prompt support.
+- Add per-player relationship memory files with score, intimacy, stance, tags, and summary.
+- Inject relationship memory into normal NPC chat prompts so NPCs can react differently to specific players.
+- Add cached relationship barks stored per player/NPC.
+- Add cached hostile first-talk barks for hostile elite NPCs.
+- Add cached trainer barks for trainer NPCs.
+- Add cached quest barks backed by the npcchat_quest_bark_cache world table.
+- Add manual quest bark commands for listing, generating, and replaying quest barks.
+- Add optional nearby questgiver scan so players can walk near eligible questgivers and hear cached quest barks without targeting them.
+- Keep automatic generation disabled by default so proximity barks do not waste API tokens unless explicitly enabled.
+- Add placeholder replacement for cached barks, including player, race, class, faction, NPC, zone, and pronoun placeholders.
+- Add separate generation model/API configuration so expensive prompt/bark generation can use a different model from live NPC chat.
+- Add safer proximity timers and cooldowns for relationship, hostile, trainer, and quest barks.
+- Fix formatted system messages that printed literal placeholder braces.
+- Fix MySQL 8 error 3065 in the nearby questgiver query by replacing DISTINCT/ORDER BY with GROUP BY and distance ordering.
+
+Quest bark behavior:
+- Quest barks are generated once and saved to the DB cache.
+- Manual and proximity playback use cached text only.
+- Nearby questgiver scanning can be enabled with NpcChat.QuestBarks.SelectedOnly = 0.
+- Missing-cache generation remains controlled by NpcChat.QuestBarks.GenerateMissing.
+
+This commit intentionally keeps proximity generation conservative and cache-first so the world feels more alive without uncontrolled token usage.

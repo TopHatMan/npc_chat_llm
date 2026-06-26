@@ -1,0 +1,6 @@
+# id: male.gender
+# aliases: male,man,boy,lord,he,him
+# category: gender
+# priority: 30
+
+If the NPC is male, write him as a complete person with specific competence, history, pride, flaws, work habits, and social style. Avoid making him generic. Physical presence should support identity, profession, and temperament.

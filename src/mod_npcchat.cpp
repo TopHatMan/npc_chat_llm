@@ -94,6 +94,12 @@ namespace
     bool        g_RequirePrefix = false;
     std::string g_Prefix;
 
+    // Debug helper for bark auto-scan. When enabled, the player receives
+    // system messages explaining why a nearby/selected bark did or did not fire.
+    bool        g_BarkDebug = false;
+    int         g_BarkDebugCooldownSec = 15;
+    std::map<uint64, time_t> g_BarkDebugCooldownUntil;
+
     // Comma-separated account IDs allowed to create/edit global sub-prompt files
     // without requiring GM security. Example: NpcChat.SubPromptCreatorAccounts = 1,7,42
     std::vector<uint32> g_SubPromptCreatorAccounts;
@@ -137,14 +143,14 @@ namespace
     int         g_TrainerBarksScanIntervalMs = 3000;
     bool        g_TrainerBarksGenerateMissing = false;
 
-    // Cached quest intro barks. Safe first pass: selected questgiver only,
-    // cache-first, and automatic generation disabled by default.
-    bool        g_QuestBarksEnabled = false;
+    // Cached quest intro barks. Ashbringer private-server default:
+    // nearby questgivers can speak/generate automatically.
+    bool        g_QuestBarksEnabled = true;
     bool        g_QuestBarksRealPlayersOnly = true;
     bool        g_QuestBarksGenerateMissing = false;
-    bool        g_QuestBarksSelectedOnly = true;
-    float       g_QuestBarksTriggerDistance = 12.0f;
-    int         g_QuestBarksChancePct = 10;
+    bool        g_QuestBarksSelectedOnly = false;
+    float       g_QuestBarksTriggerDistance = 14.0f;
+    int         g_QuestBarksChancePct = 35;
     int         g_QuestBarksPlayerCooldownSec = 900;
     int         g_QuestBarksNpcCooldownSec = 300;
     int         g_QuestBarksPairCooldownSec = 1800;
@@ -226,6 +232,9 @@ namespace
         g_RequirePrefix = sConfigMgr->GetOption<bool>("NpcChat.RequirePrefix", false);
         g_Prefix = sConfigMgr->GetOption<std::string>("NpcChat.Prefix", "");
 
+        g_BarkDebug = sConfigMgr->GetOption<bool>("NpcChat.BarkDebug", false);
+        g_BarkDebugCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.BarkDebugCooldownSec", 15);
+
         g_SubPromptCreatorAccounts = ParseAccountIdList(
             sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccounts", ""));
 
@@ -297,12 +306,12 @@ namespace
         if (g_TrainerBarksScanIntervalMs < 500)
             g_TrainerBarksScanIntervalMs = 500;
 
-        g_QuestBarksEnabled = sConfigMgr->GetOption<bool>("NpcChat.QuestBarks.Enabled", false);
+        g_QuestBarksEnabled = sConfigMgr->GetOption<bool>("NpcChat.QuestBarks.Enabled", true);
         g_QuestBarksRealPlayersOnly = sConfigMgr->GetOption<bool>("NpcChat.QuestBarks.RealPlayersOnly", true);
         g_QuestBarksGenerateMissing = sConfigMgr->GetOption<bool>("NpcChat.QuestBarks.GenerateMissing", false);
-        g_QuestBarksSelectedOnly = sConfigMgr->GetOption<bool>("NpcChat.QuestBarks.SelectedOnly", true);
-        g_QuestBarksTriggerDistance = sConfigMgr->GetOption<float>("NpcChat.QuestBarks.TriggerDistance", 12.0f);
-        g_QuestBarksChancePct = sConfigMgr->GetOption<int32>("NpcChat.QuestBarks.ChancePct", 10);
+        g_QuestBarksSelectedOnly = sConfigMgr->GetOption<bool>("NpcChat.QuestBarks.SelectedOnly", false);
+        g_QuestBarksTriggerDistance = sConfigMgr->GetOption<float>("NpcChat.QuestBarks.TriggerDistance", 14.0f);
+        g_QuestBarksChancePct = sConfigMgr->GetOption<int32>("NpcChat.QuestBarks.ChancePct", 35);
         g_QuestBarksPlayerCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.QuestBarks.PlayerCooldownSec", 900);
         g_QuestBarksNpcCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.QuestBarks.NpcCooldownSec", 300);
         g_QuestBarksPairCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.QuestBarks.PairCooldownSec", 1800);
@@ -432,6 +441,10 @@ namespace
         uint32_t    npcEntry = 0;
 
         std::string playerName;
+        uint8       playerRace = 0;
+        uint8       playerClass = 0;
+        uint8       faction = 0;
+        uint16      phase = 0;
         std::string npcName;
         std::string npcSubName;
         uint32_t    npcLevel = 0;
@@ -444,6 +457,7 @@ namespace
         bool        isHostile = false;
 
         std::string barkKind;         // relationship, hostile, trainer
+        std::string cacheContext;      // hostile_first_talk, trainer_approach, etc.
         std::string extraInstruction;
         std::string outputPath;
     };
@@ -475,6 +489,9 @@ namespace
         uint8       playerLevel = 0;
         uint8       faction = 0;
         uint16      phase = 0;
+        uint8       minLevel = 0;
+        uint8       maxLevel = 0;
+        uint8       generatedLevel = 0;
         std::string questKey;
         std::vector<QuestBarkQuestInfo> quests;
         std::string extraInstruction;
@@ -508,6 +525,12 @@ namespace
     std::map<uint64_t, time_t> g_QuestBarkPlayerCooldownUntil;
     std::map<uint64_t, time_t> g_QuestBarkNpcCooldownUntil;
     std::map<std::string, time_t> g_QuestBarkPairCooldownUntil;
+
+    // Cross-thread guard so proximity auto-generation cannot queue the same
+    // NPC/context/player-specific cache row every scan tick while the first
+    // LLM request is still running.
+    std::mutex g_NpcBarkGenerationMutex;
+    std::map<std::string, bool> g_NpcBarkGenerationPending;
     std::map<std::string, time_t> g_QuestBarkGenerationCooldownUntil;
 }
 
@@ -823,15 +846,69 @@ namespace
         return true;
     }
 
-    std::map<std::string, std::string> LoadKeyValueFile(std::string const& path)
+    std::string NormalizeGeneratedKeyValueText(std::string text)
+    {
+        // Some smaller/cheaper models obey "key=value lines" but return every
+        // key=value pair on one physical line. Normalize that into one key per
+        // line before saving and before loading cached bark files.
+        static std::vector<std::string> const keys =
+        {
+            // relationship bark keys
+            "public_friendly", "private_friendly", "public_neutral", "private_neutral",
+            "public_hostile", "private_hostile", "public_close", "private_close",
+
+            // hostile bark keys
+            "aggro_intro", "warning", "threat", "combat_taunt", "low_health",
+            "victory", "general",
+
+            // trainer bark keys
+            "available", "trainer_available", "class_available", "profession_available"
+        };
+
+        for (std::string const& key : keys)
+        {
+            std::string token = key + "=";
+            size_t pos = 0;
+            while ((pos = text.find(token, pos)) != std::string::npos)
+            {
+                if (pos > 0 && text[pos - 1] != '\n' && text[pos - 1] != '\r')
+                {
+                    // Prefer splitting only when the key looks like a new pair
+                    // after whitespace, semicolon, pipe, or another common separator.
+                    char prev = text[pos - 1];
+                    if (std::isspace(static_cast<unsigned char>(prev)) || prev == ';' || prev == '|')
+                    {
+                        text.insert(pos, "\n");
+                        pos += 1;
+                    }
+                }
+                pos += token.size();
+            }
+        }
+
+        // Trim each normalized line and drop empty/comment lines.
+        std::ostringstream out;
+        std::istringstream in(text);
+        std::string line;
+        while (std::getline(in, line))
+        {
+            line = TrimCopy(line);
+            if (line.empty() || line[0] == '#')
+                continue;
+            out << line << "\n";
+        }
+
+        return TrimCopy(out.str());
+    }
+
+    std::map<std::string, std::string> ParseKeyValueText(std::string text)
     {
         std::map<std::string, std::string> out;
-        std::ifstream f(path);
-        if (!f.is_open())
-            return out;
+        text = NormalizeGeneratedKeyValueText(text);
 
+        std::istringstream in(text);
         std::string line;
-        while (std::getline(f, line))
+        while (std::getline(in, line))
         {
             line = TrimCopy(line);
             if (line.empty() || line[0] == '#')
@@ -848,6 +925,49 @@ namespace
         }
 
         return out;
+    }
+
+    std::map<std::string, std::string> LoadKeyValueFile(std::string const& path)
+    {
+        std::string text = ReadWholeTextFile(path);
+        if (text.empty())
+            return {};
+        return ParseKeyValueText(text);
+    }
+
+    bool IsBadGeneratedBarkValue(std::string const& value)
+    {
+        std::string v = TrimCopy(value);
+        if (v.size() < 8)
+            return true;
+
+        std::string low = ToLowerCopy(v);
+        if (low == "none" || low == "null" || low == "n/a" || low == "na" || low == "undefined")
+            return true;
+        if (low.rfind("none ", 0) == 0 || low.rfind("null ", 0) == 0 || low.rfind("n/a ", 0) == 0)
+            return true;
+        if (low.find("key=value") != std::string::npos || low.find("markdown") != std::string::npos)
+            return true;
+
+        return false;
+    }
+
+    bool HasUsableBarkKeys(std::string const& text, std::vector<std::string> const& preferredKeys, size_t minimumGoodValues)
+    {
+        std::map<std::string, std::string> kv = ParseKeyValueText(text);
+        size_t good = 0;
+
+        for (std::string const& key : preferredKeys)
+        {
+            auto itr = kv.find(ToLowerCopy(key));
+            if (itr == kv.end())
+                continue;
+
+            if (!IsBadGeneratedBarkValue(itr->second))
+                ++good;
+        }
+
+        return good >= minimumGoodValues;
     }
 
     bool WriteKeyValueFile(std::string const& path, std::map<std::string, std::string> const& kv)
@@ -1099,6 +1219,26 @@ namespace
         g_SystemMessageQueue.push(std::move(msg));
     }
 
+    void BarkDebug(Player* player, std::string const& text)
+    {
+        if (!g_BarkDebug || !player)
+            return;
+
+        WorldSession* session = player->GetSession();
+        if (!session || session->IsBot())
+            return;
+
+        uint64 key = player->GetGUID().GetRawValue();
+        time_t now = std::time(nullptr);
+        if (g_BarkDebugCooldownSec > 0 && g_BarkDebugCooldownUntil[key] > now)
+            return;
+
+        if (g_BarkDebugCooldownSec > 0)
+            g_BarkDebugCooldownUntil[key] = now + g_BarkDebugCooldownSec;
+
+        ChatHandler(session).PSendSysMessage("|cff7fd6ffNPC BarkDebug:|r {}", text.c_str());
+    }
+
     int ToIntOrDefault(std::string const& text, int def = 0)
     {
         try
@@ -1172,6 +1312,178 @@ namespace
         default:
             return "Neutral";
         }
+    }
+
+    uint8 NpcChatFactionId(Player const* player)
+    {
+        std::string faction = PlayerFactionName(player);
+        if (faction == "Alliance")
+            return 1;
+        if (faction == "Horde")
+            return 2;
+        return 0;
+    }
+
+    uint16 NpcChatProgressionPhase()
+    {
+        // Keep this neutral for now. Later this can read your progression
+        // manager/config so the same NPC can have phase-specific barks.
+        return 0;
+    }
+
+    std::string NpcBarkSqlEscape(std::string s)
+    {
+        std::string out;
+        out.reserve(s.size() + 8);
+        for (char c : s)
+        {
+            if (c == '\\' || c == '\'')
+                out += '\\';
+            out += c;
+        }
+        return out;
+    }
+
+    void EnsureNpcBarkCacheTable()
+    {
+        WorldDatabase.Execute(
+            "CREATE TABLE IF NOT EXISTS `npcchat_npc_bark_cache` ("
+            "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,"
+            "`npc_entry` INT UNSIGNED NOT NULL,"
+            "`bark_context` VARCHAR(64) NOT NULL,"
+            "`faction` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`race_id` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`class_id` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`phase` SMALLINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`text` TEXT NOT NULL,"
+            "`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "`updated_at` TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,"
+            "PRIMARY KEY (`id`),"
+            "UNIQUE KEY `uq_npcchat_npc_bark` (`npc_entry`, `bark_context`, `faction`, `race_id`, `class_id`, `phase`),"
+            "KEY `idx_npcchat_npc_bark_lookup` (`npc_entry`, `bark_context`, `faction`, `race_id`, `class_id`, `phase`)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    }
+
+    void EnsureNpcBarkDisableTable()
+    {
+        WorldDatabase.Execute(
+            "CREATE TABLE IF NOT EXISTS `npcchat_npc_bark_disable` ("
+            "`npc_entry` INT UNSIGNED NOT NULL,"
+            "`bark_context` VARCHAR(64) NOT NULL,"
+            "`disabled` TINYINT UNSIGNED NOT NULL DEFAULT 1,"
+            "`reason` VARCHAR(255) NOT NULL DEFAULT '',"
+            "`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "`updated_at` TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,"
+            "PRIMARY KEY (`npc_entry`, `bark_context`)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    }
+
+    bool IsNpcBarkDisabled(uint32 npcEntry, std::string const& context, std::string* reason = nullptr)
+    {
+        if (!npcEntry || context.empty())
+            return false;
+
+        EnsureNpcBarkDisableTable();
+
+        QueryResult result = WorldDatabase.Query(
+            "SELECT `reason` FROM `npcchat_npc_bark_disable` WHERE `npc_entry`={} AND `bark_context`='{}' AND `disabled`=1 LIMIT 1",
+            npcEntry, NpcBarkSqlEscape(context));
+
+        if (!result)
+            return false;
+
+        if (reason)
+        {
+            Field* fields = result->Fetch();
+            *reason = TrimCopy(fields[0].Get<std::string>());
+        }
+
+        return true;
+    }
+
+    void SetNpcBarkDisabled(uint32 npcEntry, std::string const& context, bool disabled, std::string const& reason)
+    {
+        EnsureNpcBarkDisableTable();
+
+        if (disabled)
+        {
+            WorldDatabase.Execute(
+                "REPLACE INTO `npcchat_npc_bark_disable` (`npc_entry`,`bark_context`,`disabled`,`reason`) VALUES ({},'{}',1,'{}')",
+                npcEntry, NpcBarkSqlEscape(context), NpcBarkSqlEscape(reason));
+        }
+        else
+        {
+            WorldDatabase.Execute(
+                "REPLACE INTO `npcchat_npc_bark_disable` (`npc_entry`,`bark_context`,`disabled`,`reason`) VALUES ({},'{}',0,'{}')",
+                npcEntry, NpcBarkSqlEscape(context), NpcBarkSqlEscape(reason));
+        }
+    }
+
+    std::string NpcBarkGenerationKey(uint32 npcEntry, std::string const& context, uint8 faction, uint8 race, uint8 cls, uint16 phase)
+    {
+        return std::to_string(npcEntry) + ":" + context + ":" + std::to_string(faction) + ":" +
+            std::to_string(race) + ":" + std::to_string(cls) + ":" + std::to_string(phase);
+    }
+
+    bool TryMarkNpcBarkGenerationPending(std::string const& key)
+    {
+        std::lock_guard<std::mutex> lock(g_NpcBarkGenerationMutex);
+        if (g_NpcBarkGenerationPending[key])
+            return false;
+        g_NpcBarkGenerationPending[key] = true;
+        return true;
+    }
+
+    void ClearNpcBarkGenerationPending(std::string const& key)
+    {
+        std::lock_guard<std::mutex> lock(g_NpcBarkGenerationMutex);
+        g_NpcBarkGenerationPending.erase(key);
+    }
+
+    std::string LookupNpcBarkCache(uint32 npcEntry, std::string const& context, uint8 faction, uint8 race, uint8 cls, uint16 phase)
+    {
+        EnsureNpcBarkCacheTable();
+
+        std::ostringstream sql;
+        sql << "SELECT `text` FROM `npcchat_npc_bark_cache` "
+            << "WHERE `npc_entry`=" << npcEntry
+            << " AND `bark_context`='" << NpcBarkSqlEscape(context) << "'"
+            << " AND `phase` IN (" << uint32(phase) << ",0)"
+            << " AND `faction` IN (" << uint32(faction) << ",0)"
+            << " AND `race_id` IN (" << uint32(race) << ",0)"
+            << " AND `class_id` IN (" << uint32(cls) << ",0)"
+            << " ORDER BY ((`faction`=" << uint32(faction) << ") + (`race_id`=" << uint32(race)
+            << ") + (`class_id`=" << uint32(cls) << ") + (`phase`=" << uint32(phase)
+            << ")) DESC, `updated_at` DESC, `id` DESC LIMIT 1";
+
+        QueryResult result = WorldDatabase.Query(sql.str().c_str());
+        if (!result)
+            return "";
+
+        Field* fields = result->Fetch();
+        return TrimCopy(fields[0].Get<std::string>());
+    }
+
+    bool SaveNpcBarkCache(GenBarkRequest const& req, std::string const& context, std::string const& text)
+    {
+        std::string line = TrimCopy(text);
+        if (req.npcEntry == 0 || context.empty() || line.empty())
+            return false;
+
+        EnsureNpcBarkCacheTable();
+
+        std::ostringstream sql;
+        sql << "REPLACE INTO `npcchat_npc_bark_cache` "
+            << "(`npc_entry`,`bark_context`,`faction`,`race_id`,`class_id`,`phase`,`text`) VALUES ("
+            << req.npcEntry << ","
+            << "'" << NpcBarkSqlEscape(context) << "',"
+            << uint32(req.faction) << ","
+            << uint32(req.playerRace) << ","
+            << uint32(req.playerClass) << ","
+            << uint32(req.phase) << ","
+            << "'" << NpcBarkSqlEscape(line) << "')";
+        WorldDatabase.Execute(sql.str().c_str());
+        return true;
     }
 
     std::string GenderPronoun(Player const* player, char const* male, char const* female, char const* fallback)
@@ -1419,6 +1731,8 @@ namespace
     }
 }
 
+void GenerateHostileBarkCacheWorker(GenBarkRequest req);
+
 namespace
 {
     char const* CreatureTypeStr(uint32 t);
@@ -1464,6 +1778,56 @@ namespace
 
         bool ignoredPrivate = false;
         return FirstBark(barks, { "aggro_intro", "public_hostile", "hostile", "threat", "warning", "general" }, ignoredPrivate);
+    }
+
+    GenBarkRequest BuildAutoHostileBarkRequest(Player* player, Creature* npc)
+    {
+        GenBarkRequest req;
+        req.playerGuidRaw = player->GetGUID().GetRawValue();
+        req.npcGuidRaw = npc->GetGUID().GetRawValue();
+        req.npcEntry = npc->GetEntry();
+        req.playerName = player->GetName();
+        req.playerRace = player->getRace();
+        req.playerClass = player->getClass();
+        req.faction = NpcChatFactionId(player);
+        req.phase = NpcChatProgressionPhase();
+        req.npcName = npc->GetName();
+        req.npcLevel = npc->GetLevel();
+        req.creatureType = CreatureTypeStr(npc->GetCreatureType());
+        req.isHostile = npc->IsHostileTo(player);
+        req.stance = "an enemy";
+        req.barkKind = "hostile";
+        req.cacheContext = "hostile_first_talk";
+
+        if (CreatureTemplate const* ct = npc->GetCreatureTemplate())
+        {
+            req.npcSubName = ct->SubName;
+            if (req.creatureType.empty())
+                req.creatureType = CreatureTypeStr(ct->type);
+        }
+
+        if (AreaTableEntry const* zone = sAreaTableStore.LookupEntry(npc->GetZoneId()))
+            req.zoneName = zone->area_name[0];
+
+        return req;
+    }
+
+    bool QueueAutoHostileBarkGeneration(Player* player, Creature* npc, std::string* reason = nullptr)
+    {
+        if (!player || !npc)
+            return false;
+
+        GenBarkRequest req = BuildAutoHostileBarkRequest(player, npc);
+        std::string pendingKey = NpcBarkGenerationKey(req.npcEntry, req.cacheContext, req.faction, req.playerRace, req.playerClass, req.phase);
+        if (!TryMarkNpcBarkGenerationPending(pendingKey))
+        {
+            if (reason) *reason = "No cached hostile SQL bark exists; generation is already pending.";
+            return false;
+        }
+
+        std::thread([req = std::move(req)]() mutable { ::GenerateHostileBarkCacheWorker(std::move(req)); }).detach();
+        if (reason) *reason = "No cached hostile SQL bark exists; queued automatic generation.";
+        return true;
     }
 
     bool SpeakCachedHostileBark(Player* player, Creature* npc, bool bypassChanceAndCooldown, std::string* reason = nullptr)
@@ -1526,6 +1890,16 @@ namespace
             return false;
         }
 
+        std::string disabledReason;
+        if (IsNpcBarkDisabled(npc->GetEntry(), "hostile_first_talk", &disabledReason))
+        {
+            if (reason)
+                *reason = disabledReason.empty() ?
+                "Hostile first-talk is disabled for this NPC." :
+                "Hostile first-talk is disabled for this NPC: " + disabledReason;
+            return false;
+        }
+
         time_t now = std::time(nullptr);
         uint64_t playerKey = player->GetGUID().GetRawValue();
         uint64_t npcKey = npc->GetGUID().GetRawValue();
@@ -1560,22 +1934,44 @@ namespace
             }
         }
 
-        std::map<std::string, std::string> barks;
-        std::string barksPath = SharedHostileBarksFilePath(npc->GetName(), npc->GetEntry());
-        {
-            std::lock_guard<std::mutex> lock(g_FileMutex);
-            barks = LoadKeyValueFile(barksPath);
-        }
+        uint8 faction = NpcChatFactionId(player);
+        uint8 race = player->getRace();
+        uint8 cls = player->getClass();
+        uint16 phase = NpcChatProgressionPhase();
 
-        if (barks.empty())
+        std::string bark = LookupNpcBarkCache(npc->GetEntry(), "hostile_first_talk", faction, race, cls, phase);
+
+        if (bark.empty() && g_HostileFirstTalkGenerateMissing && !bypassChanceAndCooldown)
         {
-            if (reason) *reason = g_HostileFirstTalkGenerateMissing ?
-                "No cached hostile bark file exists. Automatic generation is not implemented in this safe pass." :
-                "No cached hostile bark file exists. Use .npcc gen bark hostile first.";
+            QueueAutoHostileBarkGeneration(player, npc, reason);
+            g_HostileBarkPlayerCooldownUntil[playerKey] = now + std::max(10, g_HostileFirstTalkPlayerCooldownSec);
+            g_HostileBarkNpcCooldownUntil[npcKey] = now + std::max(10, g_HostileFirstTalkNpcCooldownSec);
+            if (!pairKey.empty())
+                g_HostileBarkPairCooldownUntil[pairKey] = now + std::max(10, g_HostileFirstTalkPairCooldownSec);
             return false;
         }
 
-        std::string bark = SelectHostileBark(barks, npc);
+        // Backward compatibility: old manually generated .hostile_barks files
+        // can still be used if no SQL cache row exists.
+        if (bark.empty())
+        {
+            std::map<std::string, std::string> barks;
+            std::string barksPath = SharedHostileBarksFilePath(npc->GetName(), npc->GetEntry());
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                barks = LoadKeyValueFile(barksPath);
+            }
+
+            if (barks.empty())
+            {
+                if (reason) *reason = g_HostileFirstTalkGenerateMissing ?
+                    "No cached hostile SQL bark or legacy hostile bark file exists; automatic generation did not queue." :
+                    "No cached hostile SQL bark exists. Use .npcc gen bark hostile first, or enable NpcChat.HostileFirstTalk.GenerateMissing.";
+                return false;
+            }
+
+            bark = SelectHostileBark(barks, npc);
+        }
         if (bark.empty())
         {
             if (reason) *reason = "Cached hostile bark file exists, but no suitable bark key was found.";
@@ -2094,7 +2490,7 @@ std::string BuildGenerateRelationshipBarksSystemPrompt()
 {
     return
         "You are creating reusable cached bark lines for a World of Warcraft NPC relationship system. "
-        "Output ONLY key=value lines. Do not use markdown. Do not use quotes around the values. "
+        "Output ONLY key=value lines. Each key=value pair MUST be on its own separate newline. Do not use markdown. Do not use quotes around the values. "
         "Each value must be one short in-character spoken line, suitable for an NPC to say in-game when the player walks nearby. "
         "Do not mention AI, files, prompts, players, servers, tokens, or game mechanics. "
         "Use the relationship context. Public lines can be overheard; private lines should feel more personal. "
@@ -2223,6 +2619,7 @@ void GenerateRelationshipBarksWorker(GenBarkRequest req)
         if (firstNl != std::string::npos && lastFence != std::string::npos && lastFence > firstNl)
             generated = TrimCopy(generated.substr(firstNl + 1, lastFence - firstNl - 1));
     }
+    generated = NormalizeGeneratedKeyValueText(generated);
 
     {
         std::lock_guard<std::mutex> lock(g_FileMutex);
@@ -2241,12 +2638,16 @@ std::string BuildGenerateHostileBarksSystemPrompt()
 {
     return
         "You are creating reusable cached hostile first-talk bark lines for an intelligent elite World of Warcraft enemy. "
-        "Output ONLY key=value lines. Do not use markdown. Do not use quotes around the values. "
+        "Output EXACTLY these seven key=value lines, one key per physical newline, in this order: "
+        "aggro_intro, warning, threat, combat_taunt, low_health, victory, general. "
+        "Do not use markdown, numbering, bullets, quotes around values, JSON, or paragraphs. "
         "Each value must be one short in-character spoken line suitable for the enemy to say when a real player approaches. "
+        "Never output None, null, N/A, undefined, or empty values. "
+        "Never put another key name inside a value. "
         "Do not mention AI, files, prompts, players, servers, tokens, aggro tables, or game mechanics. "
-        "Use reusable placeholders when useful: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. "
+        "Use reusable placeholders only when useful: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. "
         "Prefer placeholders over hardcoding the player name, race, or class. "
-        "Use these exact keys when relevant: aggro_intro, warning, threat, combat_taunt, low_health, victory, general.";
+        "Example format: aggro_intro=You have trespassed far enough, {sir_miss}.";
 }
 
 std::string BuildGenerateHostileBarksUserPrompt(GenBarkRequest const& req, std::string const& sharedPrompt, std::string const& sharedSubPrompts, std::string const& existingBarks)
@@ -2269,6 +2670,144 @@ std::string BuildGenerateHostileBarksUserPrompt(GenBarkRequest const& req, std::
     if (!req.extraInstruction.empty()) ss << "\nExtra direction from the player/worldbuilder:\n" << req.extraInstruction << "\n";
     ss << "\nGenerate a compact hostile bark set now. Keep each value under about 25 words. The aggro_intro line is the main pre-combat approach line.";
     return ss.str();
+}
+
+std::string BuildFallbackHostileBarks(GenBarkRequest const& req)
+{
+    std::string enemyName = req.npcName.empty() ? std::string("This enemy") : req.npcName;
+
+    std::ostringstream ss;
+    ss << "aggro_intro=" << enemyName << " fixes a hard stare on {player}. You have come too far, {sir_miss}.\n";
+    ss << "warning=Turn back, {race}, before this place becomes your grave.\n";
+    ss << "threat=You will not leave here alive, {class}.\n";
+    ss << "combat_taunt=Fight, then. Let your courage break against me.\n";
+    ss << "low_health=No... this is not how my story ends.\n";
+    ss << "victory=Another fool falls where they should never have stood.\n";
+    ss << "general=This ground belongs to those strong enough to hold it.";
+    return ss.str();
+}
+
+std::string BuildFallbackHostileSingleBark(GenBarkRequest const& req)
+{
+    std::string enemyName = req.npcName.empty() ? std::string("This enemy") : req.npcName;
+    return enemyName + " fixes a hard stare on {player}. You have come too far, {sir_miss}.";
+}
+
+std::string BuildGenerateHostileSingleBarkSystemPrompt()
+{
+    return
+        "You are creating ONE cached hostile NPC first-talk bark for a World of Warcraft enemy. "
+        "Return ONLY the spoken line. No markdown, no quotes, no key names, no JSON, no bullets. "
+        "Write one short in-character sentence, or two very short sentences at most. "
+        "Never output None, null, N/A, undefined, or empty text. "
+        "Do not mention AI, files, prompts, servers, SQL, tokens, NPC IDs, aggro tables, or game mechanics. "
+        "Use reusable placeholders only when useful: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. "
+        "Prefer placeholders over hardcoding the player name, race, or class.";
+}
+
+std::string BuildGenerateHostileSingleBarkUserPrompt(GenBarkRequest const& req, std::string const& sharedPrompt, std::string const& sharedSubPrompts, std::string const& existingBark)
+{
+    std::ostringstream ss;
+    ss << "Hostile NPC facts:\n";
+    ss << "- Name: " << req.npcName << "\n";
+    ss << "- Entry ID: " << req.npcEntry << "\n";
+    if (!req.npcSubName.empty()) ss << "- Subname/title: " << req.npcSubName << "\n";
+    if (req.npcLevel) ss << "- Level: " << req.npcLevel << "\n";
+    if (!req.creatureType.empty()) ss << "- Creature type: " << req.creatureType << "\n";
+    if (!req.rankStr.empty()) ss << "- Rank: " << req.rankStr << "\n";
+    if (!req.roleStr.empty()) ss << "- Role/NPC flags: " << req.roleStr << "\n";
+    if (!req.zoneName.empty()) ss << "- Zone: " << req.zoneName << "\n";
+
+    ss << "\nApproaching player placeholders:\n";
+    ss << "- Player: {player}\n";
+    ss << "- Race: " << PlayerRaceName(req.playerRace) << " ({race})\n";
+    ss << "- Class: " << PlayerClassName(req.playerClass) << " ({class})\n";
+    ss << "- Faction: " << (req.faction == 1 ? "Alliance" : req.faction == 2 ? "Horde" : "Neutral") << " ({faction})\n";
+
+    if (!sharedSubPrompts.empty())
+        ss << "\nAttached shared subprompts:\n" << sharedSubPrompts << "\n";
+
+    if (!sharedPrompt.empty())
+        ss << "\nShared NPC profile:\n" << sharedPrompt << "\n";
+
+    if (!existingBark.empty())
+        ss << "\nExisting cached bark, if improving/replacing it:\n" << existingBark << "\n";
+
+    if (!req.extraInstruction.empty())
+        ss << "\nExtra direction:\n" << req.extraInstruction << "\n";
+
+    ss << "\nGenerate ONE reusable hostile first-talk line now. It should sound like the NPC, not a generic monster.";
+    return ss.str();
+}
+
+void GenerateHostileBarkCacheWorker(GenBarkRequest req)
+{
+    std::string pendingKey = NpcBarkGenerationKey(req.npcEntry, req.cacheContext, req.faction, req.playerRace, req.playerClass, req.phase);
+
+    std::string sharedPrompt;
+    std::string sharedSubPrompts;
+    std::string existingBark;
+
+    {
+        std::lock_guard<std::mutex> lock(g_FileMutex);
+        EnsureNpcChatDirectoriesAndDefaultPrompt();
+        sharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
+        sharedSubPrompts = LoadSubPromptBlocks(LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry)));
+    }
+
+    existingBark = LookupNpcBarkCache(req.npcEntry, req.cacheContext, req.faction, req.playerRace, req.playerClass, req.phase);
+
+    NpcChat_ApiConfig cfg = BuildGenerationApiConfig(260);
+    NpcChat_LLMResult res = NpcChat_CallLLM(
+        cfg,
+        BuildGenerateHostileSingleBarkSystemPrompt(),
+        BuildGenerateHostileSingleBarkUserPrompt(req, sharedPrompt, sharedSubPrompts, existingBark));
+
+    if (!res.success || TrimCopy(res.text).empty())
+    {
+        std::string fallback = BuildFallbackHostileSingleBark(req);
+        SaveNpcBarkCache(req, req.cacheContext, fallback);
+        QueueSystemMessage(req.playerGuidRaw, "NPC Chat hostile SQL bark generation failed or returned empty text; saved fallback DB cache row.");
+        ClearNpcBarkGenerationPending(pendingKey);
+        return;
+    }
+
+    std::string generated = TrimCopy(res.text);
+    if (generated.rfind("```", 0) == 0)
+    {
+        size_t firstNl = generated.find('\n');
+        size_t lastFence = generated.rfind("```");
+        if (firstNl != std::string::npos && lastFence != std::string::npos && lastFence > firstNl)
+            generated = TrimCopy(generated.substr(firstNl + 1, lastFence - firstNl - 1));
+    }
+
+    // Single-line cache: take the first non-empty line and reject key=value / weak junk.
+    std::istringstream in(generated);
+    std::string firstLine;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        line = TrimCopy(line);
+        if (!line.empty())
+        {
+            firstLine = line;
+            break;
+        }
+    }
+    generated = StripWrappingQuotes(firstLine.empty() ? generated : firstLine);
+
+    if (generated.find('=') != std::string::npos || IsBadGeneratedBarkValue(generated))
+    {
+        QueueSystemMessage(req.playerGuidRaw, "NPC Chat hostile SQL bark generation returned malformed/weak text; saved fallback DB cache row.");
+        generated = BuildFallbackHostileSingleBark(req);
+    }
+
+    if (!SaveNpcBarkCache(req, req.cacheContext, generated))
+        QueueSystemMessage(req.playerGuidRaw, "NPC Chat hostile SQL bark generation finished but failed to save DB cache row.");
+    else
+        QueueSystemMessage(req.playerGuidRaw, "NPC Chat hostile SQL bark saved for " + req.npcName + " entry " + std::to_string(req.npcEntry) + ".");
+
+    ClearNpcBarkGenerationPending(pendingKey);
 }
 
 void GenerateHostileBarksWorker(GenBarkRequest req)
@@ -2302,6 +2841,12 @@ void GenerateHostileBarksWorker(GenBarkRequest req)
         size_t lastFence = generated.rfind("```");
         if (firstNl != std::string::npos && lastFence != std::string::npos && lastFence > firstNl)
             generated = TrimCopy(generated.substr(firstNl + 1, lastFence - firstNl - 1));
+    }
+    generated = NormalizeGeneratedKeyValueText(generated);
+    if (!HasUsableBarkKeys(generated, { "aggro_intro", "warning", "threat", "combat_taunt", "low_health", "victory", "general" }, 3))
+    {
+        QueueSystemMessage(req.playerGuidRaw, "NPC Chat hostile bark generation returned malformed/weak key-value text; saving safe fallback barks instead.");
+        generated = BuildFallbackHostileBarks(req);
     }
     {
         std::lock_guard<std::mutex> lock(g_FileMutex);
@@ -2346,6 +2891,9 @@ namespace
             "`race_id` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
             "`class_id` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
             "`phase` SMALLINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`min_level` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`max_level` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`generated_level` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
             "`bark_type` VARCHAR(32) NOT NULL DEFAULT 'quest_available',"
             "`text` TEXT NOT NULL,"
             "`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
@@ -2535,7 +3083,29 @@ namespace
         return ss.str();
     }
 
-    std::string LookupQuestBarkCache(uint32 npcEntry, std::string const& questKey, uint8 faction, uint8 race, uint8 cls, uint16 phase)
+    uint8 QuestBarkMinLevel(std::vector<QuestBarkQuestInfo> const& quests)
+    {
+        uint32 minLevel = 0;
+        for (QuestBarkQuestInfo const& q : quests)
+        {
+            uint32 candidate = q.minLevel ? q.minLevel : (q.questLevel > 0 ? static_cast<uint32>(q.questLevel) : 0);
+            if (!candidate)
+                continue;
+            if (!minLevel || candidate < minLevel)
+                minLevel = candidate;
+        }
+        return static_cast<uint8>(std::min<uint32>(minLevel, 255));
+    }
+
+    uint8 QuestBarkMaxLevel(std::vector<QuestBarkQuestInfo> const& quests)
+    {
+        // 0 means no upper limit. The cache key already identifies the current
+        // acceptable quest set; max_level is available for later stricter phase
+        // or trainer-chain policies.
+        return 0;
+    }
+
+    std::string LookupQuestBarkCache(uint32 npcEntry, std::string const& questKey, uint8 faction, uint8 race, uint8 cls, uint16 phase, uint8 playerLevel)
     {
         EnsureQuestBarkCacheTable();
         std::ostringstream sql;
@@ -2544,11 +3114,13 @@ namespace
             << " AND `quest_key`='" << SqlEscape(questKey) << "'"
             << " AND `phase` IN (" << phase << ",0)"
             << " AND `bark_type`='quest_available'"
+            << " AND (`min_level`=0 OR `min_level` <= " << uint32(playerLevel) << ")"
+            << " AND (`max_level`=0 OR `max_level` >= " << uint32(playerLevel) << ")"
             << " AND `faction` IN (" << uint32(faction) << ",0)"
             << " AND `race_id` IN (" << uint32(race) << ",0)"
             << " AND `class_id` IN (" << uint32(cls) << ",0)"
             << " ORDER BY ((`faction`=" << uint32(faction) << ") + (`race_id`=" << uint32(race)
-            << ") + (`class_id`=" << uint32(cls) << ") + (`phase`=" << phase << ")) DESC, `updated_at` DESC, `id` DESC LIMIT 1";
+            << ") + (`class_id`=" << uint32(cls) << ") + (`phase`=" << phase << ") + (`min_level` > 0)) DESC, `min_level` DESC, `updated_at` DESC, `id` DESC LIMIT 1";
         QueryResult result = WorldDatabase.Query(sql.str().c_str());
         if (!result)
             return "";
@@ -2563,7 +3135,7 @@ namespace
         EnsureQuestBarkCacheTable();
         std::ostringstream sql;
         sql << "REPLACE INTO `npcchat_quest_bark_cache` "
-            << "(`npc_entry`,`quest_key`,`quest_ids`,`faction`,`race_id`,`class_id`,`phase`,`bark_type`,`text`) VALUES ("
+            << "(`npc_entry`,`quest_key`,`quest_ids`,`faction`,`race_id`,`class_id`,`phase`,`min_level`,`max_level`,`generated_level`,`bark_type`,`text`) VALUES ("
             << req.npcEntry << ","
             << "'" << SqlEscape(req.questKey) << "',"
             << "'" << SqlEscape(QuestIdsString(req.quests)) << "',"
@@ -2571,6 +3143,9 @@ namespace
             << uint32(req.playerRace) << ","
             << uint32(req.playerClass) << ","
             << uint32(req.phase) << ","
+            << uint32(req.minLevel) << ","
+            << uint32(req.maxLevel) << ","
+            << uint32(req.generatedLevel) << ","
             << "'quest_available',"
             << "'" << SqlEscape(text) << "')";
         WorldDatabase.Execute(sql.str().c_str());
@@ -2586,7 +3161,7 @@ namespace
             "Write one or two short in-character sentences. "
             "Do not mention AI, files, prompts, servers, tokens, quest IDs, gossip windows, SQL, or game mechanics. "
             "Do not summarize the full quest text; hook the player's attention naturally. "
-            "If there are multiple available quests, make the bark imply the NPC has several urgent matters without listing them mechanically. "
+            "This request is for ONE quest only. Do not blend multiple quests into one bark. "
             "Use reusable placeholders when useful: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. "
             "Prefer placeholders over hardcoding the player name, race, or class.";
     }
@@ -2605,10 +3180,11 @@ namespace
         ss << "- Race: " << PlayerRaceName(req.playerRace) << " ({race})\n";
         ss << "- Class: " << PlayerClassName(req.playerClass) << " ({class})\n";
         ss << "- Level: " << uint32(req.playerLevel) << " ({level})\n";
+        ss << "- Quest bark min level stored for this cache row: " << uint32(req.minLevel) << "\n";
         ss << "- Faction: " << (req.faction == 1 ? "Alliance" : req.faction == 2 ? "Horde" : "Neutral") << " ({faction})\n";
         if (!sharedPrompt.empty())
             ss << "\nShared NPC character prompt:\n" << TruncateText(sharedPrompt, 900) << "\n";
-        ss << "\nAvailable quest" << (req.quests.size() == 1 ? "" : "s") << " the player can accept right now:\n";
+        ss << "\nQuest this bark is for:\n";
         for (QuestBarkQuestInfo const& q : req.quests)
         {
             ss << "\nQuest " << q.questId << ": " << q.title << "\n";
@@ -2641,7 +3217,7 @@ namespace
             EnsureNpcChatDirectoriesAndDefaultPrompt();
             sharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
         }
-        existingBark = LookupQuestBarkCache(req.npcEntry, req.questKey, req.faction, req.playerRace, req.playerClass, req.phase);
+        existingBark = LookupQuestBarkCache(req.npcEntry, req.questKey, req.faction, req.playerRace, req.playerClass, req.phase, req.playerLevel);
         NpcChat_ApiConfig cfg = BuildGenerationApiConfig(350);
         NpcChat_LLMResult res = NpcChat_CallLLM(cfg, BuildGenerateQuestBarkSystemPrompt(), BuildGenerateQuestBarkUserPrompt(req, sharedPrompt, existingBark));
         if (!res.success || TrimCopy(res.text).empty())
@@ -2658,6 +3234,7 @@ namespace
             if (firstNl != std::string::npos && lastFence != std::string::npos && lastFence > firstNl)
                 generated = TrimCopy(generated.substr(firstNl + 1, lastFence - firstNl - 1));
         }
+        generated = NormalizeGeneratedKeyValueText(generated);
         size_t eq = generated.find('=');
         if (eq != std::string::npos && eq < 32)
             generated = TrimCopy(generated.substr(eq + 1));
@@ -2687,6 +3264,9 @@ namespace
         req.faction = PlayerFactionId(player);
         req.phase = 0;
         req.quests = std::move(quests);
+        req.minLevel = QuestBarkMinLevel(req.quests);
+        req.maxLevel = QuestBarkMaxLevel(req.quests);
+        req.generatedLevel = req.playerLevel;
         req.questKey = BuildQuestKey(req.quests);
         req.extraInstruction = extraInstruction;
         req.notifyPlayer = notify;
@@ -2704,15 +3284,63 @@ namespace
     {
         if (!g_QuestBarksGenerateMissing || quests.empty())
             return;
-        GenQuestBarkRequest req = BuildQuestBarkRequest(player, npc, quests, "", false);
-        if (req.questKey.empty())
-            return;
-        std::string genKey = std::to_string(req.npcEntry) + ":" + req.questKey + ":" + std::to_string(req.faction) + ":" + std::to_string(req.playerRace) + ":" + std::to_string(req.playerClass);
+
         time_t now = std::time(nullptr);
-        if (g_QuestBarkGenerationCooldownUntil[genKey] > now)
-            return;
-        g_QuestBarkGenerationCooldownUntil[genKey] = now + 3600;
-        std::thread(GenerateQuestBarkWorker, std::move(req)).detach();
+        for (QuestBarkQuestInfo const& q : quests)
+        {
+            std::vector<QuestBarkQuestInfo> singleQuest;
+            singleQuest.push_back(q);
+
+            GenQuestBarkRequest req = BuildQuestBarkRequest(player, npc, singleQuest, "", false);
+            if (req.questKey.empty())
+                continue;
+
+            std::string genKey = std::to_string(req.npcEntry) + ":" + req.questKey + ":" + std::to_string(req.faction) + ":" + std::to_string(req.playerRace) + ":" + std::to_string(req.playerClass) + ":" + std::to_string(req.minLevel);
+            if (g_QuestBarkGenerationCooldownUntil[genKey] > now)
+                continue;
+
+            g_QuestBarkGenerationCooldownUntil[genKey] = now + 3600;
+            std::thread(GenerateQuestBarkWorker, std::move(req)).detach();
+        }
+    }
+
+    uint32 StartQuestBarkGenerationForEachQuest(ChatHandler* handler, Player* player, Creature* npc, std::vector<QuestBarkQuestInfo> const& quests, std::string const& extraInstruction)
+    {
+        if (!player || !npc || quests.empty())
+            return 0;
+
+        uint32 started = 0;
+        std::ostringstream keys;
+
+        for (QuestBarkQuestInfo const& q : quests)
+        {
+            std::vector<QuestBarkQuestInfo> singleQuest;
+            singleQuest.push_back(q);
+
+            GenQuestBarkRequest qReq = BuildQuestBarkRequest(player, npc, singleQuest, StripWrappingQuotes(extraInstruction), true);
+            if (qReq.questKey.empty())
+                continue;
+
+            if (started)
+                keys << ", ";
+            keys << qReq.questKey;
+
+            std::thread(GenerateQuestBarkWorker, std::move(qReq)).detach();
+            ++started;
+        }
+
+        if (handler)
+        {
+            if (started == 1)
+                handler->PSendSysMessage("NPC Chat quest bark generation started for {} quest key {}.", npc->GetName(), keys.str().c_str());
+            else
+                handler->PSendSysMessage("NPC Chat quest bark generation started for {} separate quest barks on {}. Quest keys: {}.", started, npc->GetName(), keys.str().c_str());
+
+            if (started)
+                handler->PSendSysMessage("Each quest is saved as its own DB bark row. You will get system messages as they save.");
+        }
+
+        return started;
     }
 
     Creature* FindNearbyQuestgiverForBark(Player* player)
@@ -2791,10 +3419,12 @@ namespace
             if (reason) *reason = "Questgiver is outside quest bark range.";
             return false;
         }
+
         uint64 playerKey = player->GetGUID().GetRawValue();
         uint64 npcKey = npc->GetGUID().GetRawValue();
         std::string pairKey = QuestPairKey(player, npc);
         time_t now = std::time(nullptr);
+
         if (!bypassChanceAndCooldown)
         {
             if (player->IsInCombat()) { if (reason) *reason = "Player is in combat."; return false; }
@@ -2804,22 +3434,47 @@ namespace
             if (g_QuestBarksChancePct <= 0) { if (reason) *reason = "Quest bark chance is 0."; return false; }
             if (g_QuestBarksChancePct < 100 && (std::rand() % 100) >= g_QuestBarksChancePct) { if (reason) *reason = "Quest bark chance roll did not pass."; return false; }
         }
+
         std::vector<QuestBarkQuestInfo> quests = GetAcceptableQuestInfos(player, npc, onlyQuestId);
         if (quests.empty())
         {
             if (reason) *reason = onlyQuestId ? "That quest is not currently acceptable for this player." : "No acceptable quests found for this player.";
             return false;
         }
-        std::string questKey = BuildQuestKey(quests);
-        std::string bark = LookupQuestBarkCache(npc->GetEntry(), questKey, PlayerFactionId(player), player->getRace(), player->getClass(), 0);
+
+        std::string selectedQuestKey;
+        std::string bark;
+
+        // Quest barks are stored and played per quest, never as a combined multi-quest message.
+        for (QuestBarkQuestInfo const& q : quests)
+        {
+            std::vector<QuestBarkQuestInfo> singleQuest;
+            singleQuest.push_back(q);
+
+            std::string questKey = BuildQuestKey(singleQuest);
+            if (questKey.empty())
+                continue;
+
+            bark = LookupQuestBarkCache(npc->GetEntry(), questKey, PlayerFactionId(player), player->getRace(), player->getClass(), 0, player->GetLevel());
+            if (!bark.empty())
+            {
+                selectedQuestKey = questKey;
+                break;
+            }
+        }
+
         if (bark.empty())
         {
             MaybeGenerateMissingQuestBark(player, npc, quests);
-            if (reason) *reason = g_QuestBarksGenerateMissing ? "No cached quest bark existed. Generation was queued; try again after it saves." : "No cached quest bark exists. Use .npcc gen quest first.";
+            if (reason) *reason = g_QuestBarksGenerateMissing ?
+                "No cached per-quest bark existed. Generation was queued for each acceptable quest; try again after it saves." :
+                "No cached per-quest bark exists yet. Target this questgiver and use .npcc gen quest or .npcc gen bark quest first.";
             return false;
         }
+
         bark = ApplyPlayerPlaceholders(bark, player, npc);
         npc->Say(bark, LANG_UNIVERSAL);
+
         if (!bypassChanceAndCooldown)
         {
             g_QuestBarkPlayerCooldownUntil[playerKey] = now + std::max(1, g_QuestBarksPlayerCooldownSec);
@@ -2827,7 +3482,8 @@ namespace
             if (!pairKey.empty())
                 g_QuestBarkPairCooldownUntil[pairKey] = now + std::max(1, g_QuestBarksPairCooldownSec);
         }
-        if (reason) *reason = "Quest bark spoken.";
+
+        if (reason) *reason = selectedQuestKey.empty() ? "Quest bark spoken." : "Quest bark spoken for quest key " + selectedQuestKey + ".";
         return true;
     }
 }
@@ -2841,12 +3497,16 @@ namespace
     {
         return
             "You are creating reusable cached trainer bark lines for a World of Warcraft NPC trainer. "
-            "Output ONLY key=value lines. Do not use markdown. Do not use quotes around the values. "
+            "Output EXACTLY these five key=value lines, one key per physical newline, in this order: "
+            "available, trainer_available, class_available, profession_available, general. "
+            "Do not use markdown, numbering, bullets, quotes around values, JSON, or paragraphs. "
             "Each value must be one short in-character spoken line suitable for a trainer to say when a real player approaches. "
+            "Never output None, null, N/A, undefined, or empty values. "
+            "Never put another key name inside a value. "
             "Do not mention AI, files, prompts, players, servers, tokens, trainer windows, menus, or game mechanics. "
-            "Use reusable placeholders when useful: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. "
+            "Use reusable placeholders only when useful: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. "
             "Prefer placeholders over hardcoding the player name, race, or class. "
-            "Use these exact keys when relevant: available, trainer_available, class_available, profession_available, general.";
+            "Example format: available=Come here, {class}; a little training may keep you alive.";
     }
 
     std::string BuildGenerateTrainerBarksUserPrompt(GenBarkRequest const& req, std::string const& sharedPrompt, std::string const& existingBarks)
@@ -2881,6 +3541,17 @@ namespace
         return ss.str();
     }
 
+    std::string BuildFallbackTrainerBarks(GenBarkRequest const& req)
+    {
+        std::ostringstream ss;
+        ss << "available=Come here, {class}; a little training may keep you alive.\n";
+        ss << "trainer_available=Stand straight, {sir_miss}. We have work to do.\n";
+        ss << "class_available=Your path still has lessons for you, {class}.\n";
+        ss << "profession_available=Steady hands and patience turn practice into skill.\n";
+        ss << "general=Discipline first, confidence second.";
+        return ss.str();
+    }
+
     void GenerateTrainerBarksWorker(GenBarkRequest req)
     {
         std::string sharedPrompt;
@@ -2905,6 +3576,12 @@ namespace
             size_t lastFence = generated.rfind("```");
             if (firstNl != std::string::npos && lastFence != std::string::npos && lastFence > firstNl)
                 generated = TrimCopy(generated.substr(firstNl + 1, lastFence - firstNl - 1));
+        }
+        generated = NormalizeGeneratedKeyValueText(generated);
+        if (!HasUsableBarkKeys(generated, { "available", "trainer_available", "class_available", "profession_available", "general" }, 2))
+        {
+            QueueSystemMessage(req.playerGuidRaw, "NPC Chat trainer bark generation returned malformed/weak key-value text; saving safe fallback barks instead.");
+            generated = BuildFallbackTrainerBarks(req);
         }
         {
             std::lock_guard<std::mutex> lock(g_FileMutex);
@@ -3064,7 +3741,7 @@ private:
 
     void ProcessCachedBarksForPlayer(Player* player, uint32 diff)
     {
-        if (!player)
+        if (!player || !player->IsAlive())
             return;
 
         Unit* selected = player->GetSelectedUnit();
@@ -3072,25 +3749,52 @@ private:
 
         PlayerBarkTimers& timers = m_PlayerBarkTimers[player->GetGUID().GetCounter()];
 
-        // Relationship/hostile/trainer barks remain selected-NPC-only for now.
-        // Quest barks can optionally use the nearby questgiver scan when
-        // NpcChat.QuestBarks.SelectedOnly = 0.
+        // Relationship/trainer/hostile first-talk remain selected-NPC based in this focused patch.
+        // Quest barks can scan nearby questgivers when NpcChat.QuestBarks.SelectedOnly = 0.
         if (selectedNpc && selectedNpc->IsInWorld())
         {
             if (g_RelationshipBarksEnabled && ShouldRunTimer(timers.relationshipMs, diff, g_RelationshipBarksScanIntervalMs))
-                SpeakCachedRelationshipBark(player, selectedNpc, false);
-
-            if (g_HostileFirstTalkEnabled && ShouldRunTimer(timers.hostileMs, diff, g_HostileFirstTalkScanIntervalMs))
-                SpeakCachedHostileBark(player, selectedNpc, false);
+            {
+                std::string reason;
+                bool ok = SpeakCachedRelationshipBark(player, selectedNpc, false, &reason);
+                if (!ok)
+                    BarkDebug(player, "relationship bark skipped for " + std::string(selectedNpc->GetName()) + ": " + reason);
+            }
 
             if (g_TrainerBarksEnabled && ShouldRunTimer(timers.trainerMs, diff, g_TrainerBarksScanIntervalMs))
-                SpeakCachedTrainerBark(player, selectedNpc, false);
+            {
+                std::string reason;
+                bool ok = SpeakCachedTrainerBark(player, selectedNpc, false, &reason);
+                if (!ok)
+                    BarkDebug(player, "trainer bark skipped for " + std::string(selectedNpc->GetName()) + ": " + reason);
+            }
+
+            if (g_HostileFirstTalkEnabled && ShouldRunTimer(timers.hostileMs, diff, g_HostileFirstTalkScanIntervalMs))
+            {
+                std::string reason;
+                bool ok = SpeakCachedHostileBark(player, selectedNpc, false, &reason);
+                if (!ok)
+                    BarkDebug(player, "hostile first-talk skipped for " + std::string(selectedNpc->GetName()) + ": " + reason);
+            }
         }
+        else if ((g_RelationshipBarksEnabled || g_TrainerBarksEnabled || g_HostileFirstTalkEnabled) && g_BarkDebug)
+            BarkDebug(player, "selected-NPC barks skipped: no selected NPC.");
 
         if (g_QuestBarksEnabled && ShouldRunTimer(timers.questMs, diff, g_QuestBarksScanIntervalMs))
         {
-            if (Creature* questNpc = FindNearbyQuestgiverForBark(player))
-                SpeakCachedQuestBark(player, questNpc, false);
+            Creature* questNpc = FindNearbyQuestgiverForBark(player);
+            if (!questNpc)
+            {
+                BarkDebug(player, std::string("quest scan found no eligible nearby questgiver. selectedOnly=") +
+                    (g_QuestBarksSelectedOnly ? "1" : "0") +
+                    " range=" + std::to_string(g_QuestBarksTriggerDistance));
+                return;
+            }
+
+            std::string reason;
+            bool ok = SpeakCachedQuestBark(player, questNpc, false, 0, &reason);
+            if (!ok)
+                BarkDebug(player, "quest bark skipped for " + std::string(questNpc->GetName()) + ": " + reason);
         }
     }
 
@@ -3119,9 +3823,9 @@ private:
 
         // Private NPC chat shortcut.
         // Normal NPC chat can still use NpcChat.Prefix, usually "!".
-        // Private NPC chat now uses "!p message" directly. This is checked
+        // Private NPC chat now uses "@p message" directly. This is checked
         // before generic prefix stripping so it works even when NpcChat.Prefix = "!".
-        if ((text.rfind("!p", 0) == 0 || text.rfind("!P", 0) == 0) &&
+        if ((text.rfind("@p", 0) == 0 || text.rfind("@P", 0) == 0) &&
             (text.size() == 2 || std::isspace(static_cast<unsigned char>(text[2])) || text[2] == ':'))
         {
             forcePrivateReply = true;
@@ -3283,7 +3987,7 @@ public:
                 {
                     if (r.forcePrivateReply)
                     {
-                        // Targeted creature say: useful for !p private chat and hostile parley at long range.
+                        // Targeted creature say: useful for @p private chat and hostile parley at long range.
                         npc->Say(r.text, LANG_UNIVERSAL, anchor);
                     }
                     else
@@ -3443,10 +4147,17 @@ private:
             handler->PSendSysMessage(".npcc gen shared [quoted extra direction]");
             handler->PSendSysMessage(".npcc gen personal [quoted extra direction]");
             handler->PSendSysMessage(".npcc gen preview [quoted extra direction]");
+            handler->PSendSysMessage(".npcc quest list");
+            handler->PSendSysMessage(".npcc gen quest [questId] [quoted extra direction] - generates separate DB barks per quest");
+            handler->PSendSysMessage(".npcc gen bark quest [questId] [quoted extra direction] - same as gen quest");
             handler->PSendSysMessage(".npcc gen bark relationship [quoted extra direction]");
             handler->PSendSysMessage(".npcc gen bark hostile [quoted extra direction]");
+            handler->PSendSysMessage(".npcc bark quest [questId]");
             handler->PSendSysMessage(".npcc bark relationship");
             handler->PSendSysMessage(".npcc bark hostile");
+            handler->PSendSysMessage(".npcc hostile status");
+            handler->PSendSysMessage("GM: .npcc hostile disable [reason]");
+            handler->PSendSysMessage("GM: .npcc hostile enable");
             handler->PSendSysMessage(".npcc sub list");
             handler->PSendSysMessage(".npcc sub show");
             handler->PSendSysMessage(".npcc sub attach <name>");
@@ -3502,6 +4213,66 @@ private:
             handler->PSendSysMessage("Personal relationship: {}", PersonalRelationshipFilePath(player->GetName(), player->GetGUID().GetRawValue(), npc->GetName(), npc->GetEntry()).c_str());
             handler->PSendSysMessage("Personal barks: {}", PersonalBarksFilePath(player->GetName(), player->GetGUID().GetRawValue(), npc->GetName(), npc->GetEntry()).c_str());
             handler->PSendSysMessage("Shared hostile barks: {}", SharedHostileBarksFilePath(npc->GetName(), npc->GetEntry()).c_str());
+            return true;
+        }
+
+        if (StartsWithWord(arg, "hostile", rest) || StartsWithWord(arg, "enemy", rest))
+        {
+            Player* player = GetCommandPlayer(handler);
+            Creature* npc = GetSelectedCreature(handler);
+            if (!player)
+            {
+                handler->PSendSysMessage("This command must be used in game.");
+                return true;
+            }
+            if (!npc)
+            {
+                handler->PSendSysMessage("Target an NPC first.");
+                return true;
+            }
+
+            std::string subRest;
+            std::string disabledReason;
+            bool disabled = IsNpcBarkDisabled(npc->GetEntry(), "hostile_first_talk", &disabledReason);
+
+            if (rest.empty() || StartsWithWord(rest, "status", subRest))
+            {
+                handler->PSendSysMessage("Hostile first-talk status for {} entry {}: {}",
+                    npc->GetName(), npc->GetEntry(), disabled ? "disabled" : "enabled");
+                if (disabled && !disabledReason.empty())
+                    handler->PSendSysMessage("Reason: {}", disabledReason.c_str());
+                handler->PSendSysMessage("SQL cache context: hostile_first_talk");
+                return true;
+            }
+
+            if (StartsWithWord(rest, "disable", subRest) || StartsWithWord(rest, "off", subRest))
+            {
+                if (!CanManageSharedSubPrompts(handler))
+                {
+                    handler->PSendSysMessage("Only GMs or configured NPC Chat creator accounts may disable hostile first-talk for NPCs.");
+                    return true;
+                }
+                std::string why = StripWrappingQuotes(TrimCopy(subRest));
+                if (why.empty())
+                    why = "Manually disabled; NPC already has scripted dialogue or should remain silent.";
+                SetNpcBarkDisabled(npc->GetEntry(), "hostile_first_talk", true, why);
+                handler->PSendSysMessage("Disabled hostile first-talk for {} entry {}.", npc->GetName(), npc->GetEntry());
+                return true;
+            }
+
+            if (StartsWithWord(rest, "enable", subRest) || StartsWithWord(rest, "on", subRest))
+            {
+                if (!CanManageSharedSubPrompts(handler))
+                {
+                    handler->PSendSysMessage("Only GMs or configured NPC Chat creator accounts may enable hostile first-talk for NPCs.");
+                    return true;
+                }
+                SetNpcBarkDisabled(npc->GetEntry(), "hostile_first_talk", false, "");
+                handler->PSendSysMessage("Enabled hostile first-talk for {} entry {}.", npc->GetName(), npc->GetEntry());
+                return true;
+            }
+
+            handler->PSendSysMessage("Usage: .npcc hostile status | disable [reason] | enable");
             return true;
         }
 
@@ -3715,6 +4486,7 @@ private:
             handler->PSendSysMessage("NPC Chat GM: {}", IsGm(handler) ? "yes" : "no");
             handler->PSendSysMessage("NPC Chat sub-prompt creator: {}", CanCreateSubPrompts(handler) ? "yes" : "no");
             handler->PSendSysMessage("NPC Chat loaded creator account IDs: {}", JoinAccountIds(g_SubPromptCreatorAccounts));
+            handler->PSendSysMessage("NPC Chat bark debug: {} cooldownSec={}", g_BarkDebug ? "yes" : "no", g_BarkDebugCooldownSec);
             handler->PSendSysMessage("NPC Chat relationship barks enabled: {} chance={} range={} scanMs={}",
                 g_RelationshipBarksEnabled ? "yes" : "no",
                 g_RelationshipBarksChancePct,
@@ -3731,6 +4503,13 @@ private:
                 g_TrainerBarksChancePct,
                 g_TrainerBarksTriggerDistance,
                 g_TrainerBarksScanIntervalMs);
+            handler->PSendSysMessage("NPC Chat quest barks enabled: {} generateMissing={} selectedOnly={} chance={} range={} scanMs={}",
+                g_QuestBarksEnabled ? "yes" : "no",
+                g_QuestBarksGenerateMissing ? "yes" : "no",
+                g_QuestBarksSelectedOnly ? "yes" : "no",
+                g_QuestBarksChancePct,
+                g_QuestBarksTriggerDistance,
+                g_QuestBarksScanIntervalMs);
             return true;
         }
 
@@ -3856,11 +4635,9 @@ private:
                         "NPC Chat quest bark generation failed: no currently acceptable quests found on this NPC for this player.");
                     return true;
                 }
-                std::string qKey = BuildQuestKey(quests);
-                GenQuestBarkRequest qReq = BuildQuestBarkRequest(player, npc, quests, StripWrappingQuotes(extraQuest), true);
-                std::thread(GenerateQuestBarkWorker, std::move(qReq)).detach();
-                handler->PSendSysMessage("NPC Chat quest bark generation started for {} quest key {}.", npc->GetName(), qKey.c_str());
-                handler->PSendSysMessage("You will get a system message when the DB cache is saved.");
+                uint32 started = StartQuestBarkGenerationForEachQuest(handler, player, npc, quests, extraQuest);
+                if (!started)
+                    handler->PSendSysMessage("NPC Chat quest bark generation did not start.");
                 return true;
             }
 
@@ -3885,9 +4662,40 @@ private:
                     barkMode = "trainer";
                     extraBark = barkRest;
                 }
+                else if (StartsWithWord(genKindRest, "quest", barkRest) || StartsWithWord(genKindRest, "quests", barkRest))
+                {
+                    uint32 onlyQuestId = 0;
+                    std::string extraQuest = barkRest;
+                    std::string trimmedQuest = TrimCopy(barkRest);
+                    if (!trimmedQuest.empty())
+                    {
+                        size_t firstSpace = trimmedQuest.find_first_of(" \t");
+                        std::string maybeId = firstSpace == std::string::npos ? trimmedQuest : trimmedQuest.substr(0, firstSpace);
+                        bool digitsOnly = !maybeId.empty() && std::all_of(maybeId.begin(), maybeId.end(), [](unsigned char c) { return std::isdigit(c); });
+                        if (digitsOnly)
+                        {
+                            onlyQuestId = static_cast<uint32>(std::stoul(maybeId));
+                            extraQuest = firstSpace == std::string::npos ? "" : TrimCopy(trimmedQuest.substr(firstSpace + 1));
+                        }
+                    }
+
+                    std::vector<QuestBarkQuestInfo> quests = GetAcceptableQuestInfos(player, npc, onlyQuestId);
+                    if (quests.empty())
+                    {
+                        handler->PSendSysMessage(onlyQuestId ?
+                            "NPC Chat quest bark generation failed: that quest is not currently acceptable from this NPC for this player." :
+                            "NPC Chat quest bark generation failed: no currently acceptable quests found on this NPC for this player.");
+                        return true;
+                    }
+
+                    uint32 started = StartQuestBarkGenerationForEachQuest(handler, player, npc, quests, extraQuest);
+                    if (!started)
+                        handler->PSendSysMessage("NPC Chat quest bark generation did not start.");
+                    return true;
+                }
                 else if (!genKindRest.empty())
                 {
-                    handler->PSendSysMessage("Usage: .npcc gen bark <relationship|hostile|trainer> [quoted extra direction]");
+                    handler->PSendSysMessage("Usage: .npcc gen bark <relationship|hostile|trainer|quest> [quoted extra direction]");
                     return true;
                 }
                 GenBarkRequest barkReq;
@@ -3901,10 +4709,25 @@ private:
                         handler->PSendSysMessage("Only GMs or configured NPC Chat creator accounts may generate shared hostile barks.");
                         return true;
                     }
-                    barkReq.outputPath = SharedHostileBarksFilePath(npc->GetName(), npc->GetEntry());
-                    std::thread(GenerateHostileBarksWorker, std::move(barkReq)).detach();
-                    handler->PSendSysMessage("NPC Chat hostile bark generation started for {}.", npc->GetName());
-                    handler->PSendSysMessage("You will get a system message when the .hostile_barks file is saved.");
+                    std::string disabledReason;
+                    if (IsNpcBarkDisabled(npc->GetEntry(), "hostile_first_talk", &disabledReason))
+                    {
+                        handler->PSendSysMessage("NPC Chat hostile first-talk is disabled for {} entry {}{}{}.",
+                            npc->GetName(), npc->GetEntry(),
+                            disabledReason.empty() ? "" : ": ",
+                            disabledReason.empty() ? "" : disabledReason.c_str());
+                        return true;
+                    }
+                    barkReq.cacheContext = "hostile_first_talk";
+                    std::string pendingKey = NpcBarkGenerationKey(barkReq.npcEntry, barkReq.cacheContext, barkReq.faction, barkReq.playerRace, barkReq.playerClass, barkReq.phase);
+                    if (!TryMarkNpcBarkGenerationPending(pendingKey))
+                    {
+                        handler->PSendSysMessage("NPC Chat hostile bark generation is already pending for this NPC/context/player type.");
+                        return true;
+                    }
+                    std::thread([barkReq = std::move(barkReq)]() mutable { ::GenerateHostileBarkCacheWorker(std::move(barkReq)); }).detach();
+                    handler->PSendSysMessage("NPC Chat hostile SQL bark generation started for {}.", npc->GetName());
+                    handler->PSendSysMessage("You will get a system message when the DB cache row is saved.");
                 }
                 else if (barkMode == "trainer")
                 {
