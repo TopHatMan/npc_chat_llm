@@ -49,6 +49,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <list>
 #include <vector>
 
  // ===========================================================================
@@ -64,6 +65,8 @@ namespace
     double      g_Temperature = 0.85;
     int         g_TimeoutSec = 30;
     std::string g_ExtraParams;
+    bool        g_VerifyCert = true;     // NpcChat.Api.VerifyCert (https only; set 0 for self-signed/local proxy)
+    int         g_MaxConcurrent = 4;     // NpcChat.Api.MaxConcurrentRequests (0 = unlimited)
 
     // Optional separate API/model for expensive generation jobs.
     // Normal live roleplay uses NpcChat.* above; one-time prompt/bark/quest
@@ -91,6 +94,12 @@ namespace
     float       g_HostileMaxDistance = 100.0f;   // still close enough to "shout"
     bool        g_HostileForcePrivateReply = true;
 
+    // Untargeted chat: with no NPC selected, a /say or /yell can be answered by a nearby NPC.
+    // A yell (or a hostile-sounding line) near enemies lets the nearest enemy answer back.
+    bool        g_UntargetedChatEnabled = false;
+    float       g_UntargetedYellRange = 50.0f;
+    bool        g_UntargetedHostileYellEnabled = true;
+
     bool        g_RequirePrefix = false;
     std::string g_Prefix;
 
@@ -103,6 +112,11 @@ namespace
     // Comma-separated account IDs allowed to create/edit global sub-prompt files
     // without requiring GM security. Example: NpcChat.SubPromptCreatorAccounts = 1,7,42
     std::vector<uint32> g_SubPromptCreatorAccounts;
+
+    // When true, disk sub-prompt .prompt files are imported into the npcchat_subprompt SQL table on
+    // first world update (new rows only; never clobbers SQL edits). Lets users author on disk and
+    // have it injected to SQL automatically. Force a full re-sync with: .npcc sub import overwrite
+    bool g_SubPromptImportOnStartup = true;
 
     // Cached relationship barks: NPCs can speak first, but only from saved .barks files.
     // No automatic LLM call happens from proximity scanning unless a future feature explicitly enables it.
@@ -202,6 +216,8 @@ namespace
         g_Temperature = sConfigMgr->GetOption<float>("NpcChat.Temperature", 0.85f);
         g_TimeoutSec = sConfigMgr->GetOption<int32>("NpcChat.RequestTimeoutSec", 30);
         g_ExtraParams = sConfigMgr->GetOption<std::string>("NpcChat.ModelExtraParameters", "");
+        g_VerifyCert = sConfigMgr->GetOption<bool>("NpcChat.Api.VerifyCert", true);
+        g_MaxConcurrent = sConfigMgr->GetOption<int32>("NpcChat.Api.MaxConcurrentRequests", 4);
 
         // Backward-compatible generation settings. The old GeneratePrompt* keys still work,
         // while the new NpcChat.Generation.* block can point at a stronger model/API.
@@ -229,6 +245,10 @@ namespace
         g_HostileMaxDistance = sConfigMgr->GetOption<float>("NpcChat.HostileMaxDistance", 100.0f);
         g_HostileForcePrivateReply = sConfigMgr->GetOption<bool>("NpcChat.HostileForcePrivateReply", true);
 
+        g_UntargetedChatEnabled = sConfigMgr->GetOption<bool>("NpcChat.UntargetedChat.Enable", false);
+        g_UntargetedYellRange = sConfigMgr->GetOption<float>("NpcChat.UntargetedChat.YellRange", 50.0f);
+        g_UntargetedHostileYellEnabled = sConfigMgr->GetOption<bool>("NpcChat.UntargetedChat.HostileYell", true);
+
         g_RequirePrefix = sConfigMgr->GetOption<bool>("NpcChat.RequirePrefix", false);
         g_Prefix = sConfigMgr->GetOption<std::string>("NpcChat.Prefix", "");
 
@@ -237,6 +257,7 @@ namespace
 
         g_SubPromptCreatorAccounts = ParseAccountIdList(
             sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccounts", ""));
+        g_SubPromptImportOnStartup = sConfigMgr->GetOption<bool>("NpcChat.SubPrompt.ImportOnStartup", true);
 
         // Accept a couple of aliases too, so a typo/name preference in the conf
         // does not leave a trusted play account locked out.
@@ -337,6 +358,8 @@ namespace
         cfg.temperature = g_Temperature;
         cfg.timeoutSec = g_TimeoutSec;
         cfg.extraParams = g_ExtraParams;
+        cfg.verifyCert = g_VerifyCert;
+        cfg.maxConcurrent = g_MaxConcurrent;
         return cfg;
     }
 
@@ -350,6 +373,8 @@ namespace
         cfg.temperature = g_GeneratePromptTemperature;
         cfg.timeoutSec = g_GenerationTimeoutSec > 0 ? g_GenerationTimeoutSec : g_TimeoutSec;
         cfg.extraParams = g_GenerationExtraParams.empty() ? g_ExtraParams : g_GenerationExtraParams;
+        cfg.verifyCert = g_VerifyCert;
+        cfg.maxConcurrent = g_MaxConcurrent;
         return cfg;
     }
 }
@@ -387,6 +412,7 @@ namespace
         std::string fightState;
         bool        forcePrivateReply = false;
 
+        std::string autoTags;         // auto-linker: resolved creature archetype tags (CSV)
         std::string message;
     };
 
@@ -430,6 +456,7 @@ namespace
         std::string fightState;
 
         std::string mode;             // shared, personal, preview
+        std::string autoTags;         // auto-linker: resolved creature archetype tags (CSV)
         std::string extraInstruction;
         std::string outputPath;
     };
@@ -457,6 +484,7 @@ namespace
         bool        isHostile = false;
 
         std::string barkKind;         // relationship, hostile, trainer
+        std::string autoTags;         // auto-linker: resolved creature archetype tags (CSV)
         std::string cacheContext;      // hostile_first_talk, trainer_approach, etc.
         std::string extraInstruction;
         std::string outputPath;
@@ -494,6 +522,8 @@ namespace
         uint8       generatedLevel = 0;
         std::string questKey;
         std::vector<QuestBarkQuestInfo> quests;
+        std::string autoTags;         // auto-linker: resolved creature archetype tags (CSV)
+        std::string barkType = "quest_available"; // quest_available | quest_ender
         std::string extraInstruction;
         bool        notifyPlayer = true;
     };
@@ -1087,6 +1117,196 @@ namespace
         return WriteSubPromptNameList(listPath, names);
     }
 
+    // Forward declaration: SqlEscape is defined far below, but the sub-prompt SQL helpers here need it.
+    std::string SqlEscape(std::string s);
+
+    // ---- Sub-prompt SQL layer (SQL is source of truth; disk is the authoring/fallback surface) ----
+
+    void EnsureSubPromptTable()
+    {
+        WorldDatabase.Execute(
+            "CREATE TABLE IF NOT EXISTS `npcchat_subprompt` ("
+            "`id` VARCHAR(96) NOT NULL,"
+            "`category` VARCHAR(32) NOT NULL DEFAULT 'trait',"
+            "`aliases` VARCHAR(255) NOT NULL DEFAULT '',"
+            "`priority` SMALLINT NOT NULL DEFAULT 50,"
+            "`relationship_aware` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`enabled` TINYINT UNSIGNED NOT NULL DEFAULT 1,"
+            "`source` VARCHAR(16) NOT NULL DEFAULT 'disk',"
+            "`text` TEXT NOT NULL,"
+            "`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "`updated_at` TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,"
+            "PRIMARY KEY (`id`),"
+            "KEY `idx_npcchat_subprompt_cat` (`category`, `priority`)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    }
+
+    bool IsKnownSubPromptCategory(std::string const& c)
+    {
+        static const char* kinds[] = { "race", "gender", "place", "archetype",
+            "relationship", "tone", "npc", "class", "faction", "trait" };
+        for (char const* k : kinds)
+            if (c == k)
+                return true;
+        return false;
+    }
+
+    int DefaultSubPromptPriority(std::string const& cat)
+    {
+        if (cat == "npc") return 150;
+        if (cat == "relationship") return 110;
+        if (cat == "race") return 100;
+        if (cat == "archetype") return 90;
+        if (cat == "place") return 80;
+        if (cat == "faction") return 70;
+        if (cat == "class") return 60;
+        if (cat == "trait" || cat == "tone") return 40;
+        if (cat == "gender") return 30;
+        return 50;
+    }
+
+    struct SubPromptRecord
+    {
+        std::string id;
+        std::string category = "trait";
+        std::string aliases;
+        int priority = 50;
+        int relationshipAware = 0;
+        std::string text;
+    };
+
+    // Parses both the structured header format ("# id / # aliases / # category / # priority /
+    // # relationship") and plain-prose .prompt files. For plain files, category is inferred from a
+    // dotted filename suffix (e.g. foo.race -> race) and priority from the category default.
+    SubPromptRecord ParseSubPrompt(std::string const& stem, std::string const& raw)
+    {
+        SubPromptRecord rec;
+        rec.id = NormalizeSubPromptName(stem);
+
+        std::string inferredCat;
+        {
+            size_t dot = stem.find_last_of('.');
+            if (dot != std::string::npos)
+            {
+                std::string suf = ToLowerCopy(stem.substr(dot + 1));
+                if (IsKnownSubPromptCategory(suf))
+                    inferredCat = suf;
+            }
+        }
+
+        std::istringstream in(raw);
+        std::string line;
+        std::ostringstream body;
+        bool inHeader = true;
+        bool haveCategory = false;
+        bool havePriority = false;
+
+        while (std::getline(in, line))
+        {
+            std::string trimmed = TrimCopy(line);
+            if (inHeader && !trimmed.empty() && trimmed[0] == '#')
+            {
+                std::string h = TrimCopy(trimmed.substr(1));
+                size_t colon = h.find(':');
+                if (colon != std::string::npos)
+                {
+                    std::string key = ToLowerCopy(TrimCopy(h.substr(0, colon)));
+                    std::string val = TrimCopy(h.substr(colon + 1));
+                    if (key == "category") { rec.category = ToLowerCopy(val); haveCategory = true; }
+                    else if (key == "aliases") rec.aliases = val;
+                    else if (key == "priority") { try { rec.priority = std::stoi(val); havePriority = true; } catch (...) {} }
+                    else if (key == "relationship")
+                    {
+                        std::string lv = ToLowerCopy(val);
+                        rec.relationshipAware = (lv == "yes" || lv == "1" || lv == "true") ? 1 : 0;
+                    }
+                    // an explicit "# id:" is intentionally ignored for the DB key; we key off the
+                    // normalized filename so SQL lookups match the rest of the module.
+                }
+                continue;
+            }
+            if (inHeader && trimmed.empty())
+                continue; // blank line(s) before the body
+            inHeader = false;
+            body << line << "\n";
+        }
+
+        rec.text = TrimCopy(body.str());
+        if (!haveCategory && !inferredCat.empty())
+            rec.category = inferredCat;
+        if (rec.category.empty())
+            rec.category = "trait";
+        if (rec.category == "relationship")
+            rec.relationshipAware = 1;
+        if (!havePriority)
+            rec.priority = DefaultSubPromptPriority(rec.category);
+        return rec;
+    }
+
+    // Scans the on-disk subprompts folder and upserts each fragment into SQL. overwrite=false uses
+    // INSERT IGNORE (adds new prompts only, never clobbers SQL edits); overwrite=true forces a
+    // full disk->SQL re-sync. Returns the number of files processed.
+    int ImportSubPromptsFromDisk(bool overwrite)
+    {
+        EnsureSubPromptTable();
+        int count = 0;
+        try
+        {
+            std::filesystem::path root(SubPromptRootPath());
+            if (!std::filesystem::exists(root))
+                return 0;
+
+            for (auto const& it : std::filesystem::directory_iterator(root))
+            {
+                if (!it.is_regular_file())
+                    continue;
+                if (it.path().extension().string() != ".prompt")
+                    continue;
+
+                std::string raw = ReadWholeTextFile(it.path().string());
+                if (raw.empty())
+                    continue;
+
+                SubPromptRecord rec = ParseSubPrompt(it.path().stem().string(), raw);
+                if (rec.id.empty() || rec.text.empty())
+                    continue;
+
+                std::ostringstream sql;
+                sql << (overwrite ? "REPLACE INTO" : "INSERT IGNORE INTO")
+                    << " `npcchat_subprompt` (`id`,`category`,`aliases`,`priority`,`relationship_aware`,`source`,`text`) VALUES ('"
+                    << SqlEscape(rec.id) << "','"
+                    << SqlEscape(rec.category) << "','"
+                    << SqlEscape(rec.aliases) << "',"
+                    << rec.priority << ","
+                    << rec.relationshipAware << ","
+                    << "'disk','"
+                    << SqlEscape(rec.text) << "')";
+                WorldDatabase.Execute(sql.str().c_str());
+                ++count;
+            }
+        }
+        catch (std::exception const&)
+        {
+            // best effort
+        }
+        return count;
+    }
+
+    // SQL first, disk fallback. key is already normalized by the caller.
+    std::string LoadSubPromptTextSqlFirst(std::string const& key)
+    {
+        if (key.empty())
+            return "";
+
+        EnsureSubPromptTable();
+        if (QueryResult r = WorldDatabase.Query(
+            "SELECT `text` FROM `npcchat_subprompt` WHERE `id`='{}' AND `enabled`=1 LIMIT 1",
+            SqlEscape(key)))
+            return TrimCopy(r->Fetch()[0].Get<std::string>());
+
+        return ReadWholeTextFile(SubPromptFilePath(key)); // disk fallback
+    }
+
     std::string LoadSubPromptBlocks(std::vector<std::string> const& names)
     {
         std::ostringstream ss;
@@ -1096,13 +1316,263 @@ namespace
             if (key.empty())
                 continue;
 
-            std::string text = ReadWholeTextFile(SubPromptFilePath(key));
+            std::string text = LoadSubPromptTextSqlFirst(key);
             if (text.empty())
                 continue;
 
             ss << "[" << key << "]\n" << text << "\n\n";
         }
         return TrimCopy(ss.str());
+    }
+
+    // ---- Per-NPC speak profile (SQL): eligibility, speak chance, kind, and explicit archetype tags ----
+    // This is the "NPCs in general" table: it carries can_speak (the hostile eligibility record),
+    // an optional per-NPC speak_chance override, a kind, and explicit tags that the auto-linker can't
+    // derive from the creature itself (most importantly humanoid race, e.g. "dwarf,bronzebeard").
+
+    void EnsureNpcProfileTable()
+    {
+        WorldDatabase.Execute(
+            "CREATE TABLE IF NOT EXISTS `npcchat_npc_profile` ("
+            "`npc_entry` INT UNSIGNED NOT NULL,"
+            "`can_speak` TINYINT UNSIGNED NOT NULL DEFAULT 0,"
+            "`speak_chance` TINYINT UNSIGNED NOT NULL DEFAULT 0,"   // 0 = use the global default
+            "`npc_kind` VARCHAR(16) NOT NULL DEFAULT 'auto',"        // quest | regular | hostile | auto
+            "`tags` VARCHAR(255) NOT NULL DEFAULT '',"               // explicit archetype tags (CSV)
+            "`created_by_account` INT UNSIGNED NOT NULL DEFAULT 0,"
+            "`created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "`updated_at` TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,"
+            "PRIMARY KEY (`npc_entry`)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    }
+
+    struct NpcProfile
+    {
+        bool        hasRow = false;
+        int         canSpeak = 0;
+        int         speakChance = 0;
+        std::string kind = "auto";
+        std::string tags;
+    };
+
+    NpcProfile LoadNpcProfile(uint32 npcEntry)
+    {
+        NpcProfile p;
+        EnsureNpcProfileTable();
+        if (QueryResult r = WorldDatabase.Query(
+            "SELECT `can_speak`,`speak_chance`,`npc_kind`,`tags` FROM `npcchat_npc_profile` WHERE `npc_entry`={} LIMIT 1",
+            npcEntry))
+        {
+            Field* f = r->Fetch();
+            p.hasRow = true;
+            p.canSpeak = f[0].Get<uint8>();
+            p.speakChance = f[1].Get<uint8>();
+            p.kind = f[2].Get<std::string>();
+            p.tags = f[3].Get<std::string>();
+        }
+        return p;
+    }
+
+    std::string LoadNpcProfileTags(uint32 npcEntry)
+    {
+        return LoadNpcProfile(npcEntry).tags;
+    }
+
+    // Opt-in eligibility used by the aggro-driven hostile speak: an NPC only auto-taunts once a
+    // profile row marks it can_speak (which generating a hostile bark does automatically).
+    bool NpcProfileCanSpeak(uint32 npcEntry)
+    {
+        return LoadNpcProfile(npcEntry).canSpeak != 0;
+    }
+
+    // Upsert that preserves other columns. createdByAccount is recorded only when the row is new.
+    void UpsertNpcProfileField(uint32 npcEntry, std::string const& column, std::string const& valueLiteral, uint32 createdByAccount)
+    {
+        EnsureNpcProfileTable();
+        std::ostringstream sql;
+        sql << "INSERT INTO `npcchat_npc_profile` (`npc_entry`,`" << column << "`,`created_by_account`) VALUES ("
+            << npcEntry << "," << valueLiteral << "," << createdByAccount << ") "
+            << "ON DUPLICATE KEY UPDATE `" << column << "`=" << valueLiteral;
+        WorldDatabase.Execute(sql.str().c_str());
+    }
+
+    void SetNpcProfileCanSpeak(uint32 npcEntry, bool canSpeak, uint32 createdByAccount = 0)
+    {
+        UpsertNpcProfileField(npcEntry, "can_speak", canSpeak ? "1" : "0", createdByAccount);
+    }
+
+    // Effective speak chance: per-NPC override when set (>0), else the supplied global default.
+    int EffectiveSpeakChance(uint32 npcEntry, int globalDefault)
+    {
+        NpcProfile p = LoadNpcProfile(npcEntry);
+        return (p.hasRow && p.speakChance > 0) ? p.speakChance : globalDefault;
+    }
+
+    // Attribute auto-linker (resolver half, MAIN THREAD: reads creature fields only, no DB).
+    // Derives a CSV of archetype tags from a creature so the matcher can pull the right sub-prompts
+    // without anyone manually attaching them. Humanoid player-race (human/dwarf/orc) is NOT derivable
+    // from the creature here (the core has no such field) and is left to per-NPC tags / profiles.
+    std::string ResolveCreatureAutoTags(Creature* npc)
+    {
+        if (!npc)
+            return "";
+
+        std::vector<std::string> tags;
+        tags.push_back(npc->getGender() == GENDER_FEMALE ? "female" : "male");
+
+        if (CreatureTemplate const* t = npc->GetCreatureTemplate())
+        {
+            switch (t->type)
+            {
+            case CREATURE_TYPE_BEAST:      tags.push_back("beast"); break;
+            case CREATURE_TYPE_DRAGONKIN:  tags.push_back("dragonkin"); break;
+            case CREATURE_TYPE_DEMON:      tags.push_back("demon"); break;
+            case CREATURE_TYPE_ELEMENTAL:  tags.push_back("elemental"); break;
+            case CREATURE_TYPE_GIANT:      tags.push_back("giant"); break;
+            case CREATURE_TYPE_UNDEAD:     tags.push_back("undead"); break;
+            case CREATURE_TYPE_HUMANOID:   tags.push_back("humanoid"); break;
+            case CREATURE_TYPE_MECHANICAL: tags.push_back("mechanical"); break;
+            case CREATURE_TYPE_CRITTER:    tags.push_back("critter"); break;
+            default: break;
+            }
+
+            uint32 nf = t->npcflag;
+            if (nf & UNIT_NPC_FLAG_QUESTGIVER)   tags.push_back("quest_giver");
+            if (nf & UNIT_NPC_FLAG_VENDOR)       tags.push_back("vendor");
+            if (nf & UNIT_NPC_FLAG_REPAIR)       tags.push_back("repair_vendor");
+            if (nf & UNIT_NPC_FLAG_FLIGHTMASTER) tags.push_back("flight_master");
+            if (nf & UNIT_NPC_FLAG_INNKEEPER)    tags.push_back("innkeeper");
+            if (nf & UNIT_NPC_FLAG_BANKER)       tags.push_back("banker");
+            if (nf & UNIT_NPC_FLAG_STABLEMASTER) tags.push_back("stable_master");
+            if (nf & UNIT_NPC_FLAG_TRAINER)      tags.push_back("trainer");
+        }
+
+        if (AreaTableEntry const* zone = sAreaTableStore.LookupEntry(npc->GetZoneId()))
+        {
+            std::string zn = zone->area_name[0] ? ToLowerCopy(zone->area_name[0]) : "";
+            size_t sp = zn.find(' ');
+            std::string first = NormalizeSubPromptName(sp == std::string::npos ? zn : zn.substr(0, sp));
+            if (!first.empty())
+                tags.push_back(first);
+        }
+
+        // Explicit profile tags supply what the creature can't tell us by itself - most importantly
+        // humanoid race (dwarf/human/orc) and any custom archetype the author assigned.
+        std::string profileTags = LoadNpcProfileTags(npc->GetEntry());
+        if (!profileTags.empty())
+        {
+            std::istringstream ts(profileTags);
+            std::string t;
+            while (std::getline(ts, t, ','))
+            {
+                std::string n = NormalizeSubPromptName(t);
+                if (!n.empty())
+                    tags.push_back(n);
+            }
+        }
+
+        std::ostringstream csv;
+        for (size_t i = 0; i < tags.size(); ++i)
+            csv << (i ? "," : "") << tags[i];
+        return csv.str();
+    }
+
+    // Attribute auto-linker (matcher half, runs in the generation worker via the DB pool).
+    // Maps the resolver's tags to concrete sub-prompt ids by matching each tag against a fragment's
+    // base name (id minus its "_<category>" suffix) or any of its aliases, then orders by priority so
+    // a specific NPC/archetype fragment outranks a broad gender one. Returns sub-prompt ids to attach.
+    std::vector<std::string> MatchSubPromptNamesForTags(std::string const& csv)
+    {
+        std::vector<std::string> out;
+        if (csv.empty())
+            return out;
+
+        EnsureSubPromptTable();
+
+        std::vector<std::string> tags;
+        {
+            std::istringstream ss(csv);
+            std::string t;
+            while (std::getline(ss, t, ','))
+            {
+                std::string n = NormalizeSubPromptName(t);
+                if (!n.empty())
+                    tags.push_back(n);
+            }
+        }
+        if (tags.empty())
+            return out;
+
+        QueryResult r = WorldDatabase.Query(
+            "SELECT `id`,`category`,`aliases`,`priority` FROM `npcchat_subprompt` WHERE `enabled`=1");
+        if (!r)
+            return out;
+
+        struct Hit { std::string id; int priority; };
+        std::vector<Hit> hits;
+        do
+        {
+            Field* f = r->Fetch();
+            std::string id = f[0].Get<std::string>();
+            std::string cat = f[1].Get<std::string>();
+            std::string aliases = f[2].Get<std::string>();
+            int prio = f[3].Get<int32>();
+
+            std::vector<std::string> keys;
+            std::string base = id;
+            std::string suffix = "_" + NormalizeSubPromptName(cat);
+            if (suffix.size() > 1 && base.size() > suffix.size() &&
+                base.compare(base.size() - suffix.size(), suffix.size(), suffix) == 0)
+                base = base.substr(0, base.size() - suffix.size());
+            keys.push_back(base);
+
+            std::istringstream as(aliases);
+            std::string a;
+            while (std::getline(as, a, ','))
+            {
+                std::string n = NormalizeSubPromptName(a);
+                if (!n.empty())
+                    keys.push_back(n);
+            }
+
+            bool matched = false;
+            for (std::string const& tag : tags)
+            {
+                for (std::string const& k : keys)
+                    if (k == tag) { matched = true; break; }
+                if (matched)
+                    break;
+            }
+            if (matched)
+                hits.push_back({ id, prio });
+        } while (r->NextRow());
+
+        std::sort(hits.begin(), hits.end(),
+            [](Hit const& a, Hit const& b) { return a.priority > b.priority; });
+
+        for (Hit const& h : hits)
+        {
+            bool dup = false;
+            for (std::string const& existing : out)
+                if (existing == h.id) { dup = true; break; }
+            if (!dup)
+                out.push_back(h.id);
+        }
+        return out;
+    }
+
+    // Convenience: merge manually-attached names with auto-linked names (deduped, manual first).
+    std::vector<std::string> MergeSubPromptNames(std::vector<std::string> manual, std::string const& autoTagsCsv)
+    {
+        for (std::string const& n : MatchSubPromptNamesForTags(autoTagsCsv))
+        {
+            bool dup = false;
+            for (std::string const& existing : manual)
+                if (existing == n) { dup = true; break; }
+            if (!dup)
+                manual.push_back(n);
+        }
+        return manual;
     }
 
     std::string JoinNames(std::vector<std::string> const& names)
@@ -1260,6 +1730,110 @@ namespace
         if (it == kv.end())
             return "";
         return TrimCopy(it->second);
+    }
+
+    // ---- Personal relationship SQL layer (SQL source of truth; disk = fallback/backup) ----
+    // Relationships are per (player, npc_entry). Putting them in SQL makes "which NPCs near me do I
+    // know" a single query, which is what powers the pass-by greeting. Reads are SQL-first with a
+    // disk fallback that lazily migrates a disk-only relationship into SQL on read, so existing files
+    // move over as they're touched. Writes go to SQL and keep the disk file as a backup.
+
+    void EnsureRelationshipTable()
+    {
+        WorldDatabase.Execute(
+            "CREATE TABLE IF NOT EXISTS `npcchat_relationship` ("
+            "`player_guid` BIGINT UNSIGNED NOT NULL,"
+            "`npc_entry` INT UNSIGNED NOT NULL,"
+            "`player_name` VARCHAR(64) NOT NULL DEFAULT '',"
+            "`npc_name` VARCHAR(64) NOT NULL DEFAULT '',"
+            "`score` INT NOT NULL DEFAULT 0,"
+            "`stance` VARCHAR(32) NOT NULL DEFAULT '',"
+            "`data` TEXT NOT NULL,"
+            "`updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+            "PRIMARY KEY (`player_guid`, `npc_entry`),"
+            "KEY `idx_npcchat_rel_player` (`player_guid`)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    }
+
+    std::string SerializeKeyValueMap(std::map<std::string, std::string> const& kv)
+    {
+        std::ostringstream ss;
+        for (auto const& p : kv)
+            if (!TrimCopy(p.second).empty())
+                ss << p.first << "=" << TrimCopy(p.second) << "\n";
+        return ss.str();
+    }
+
+    void UpsertRelationshipRow(uint64_t playerGuidRaw, uint32 npcEntry,
+        std::string const& playerName, std::string const& npcName,
+        std::map<std::string, std::string> const& kv)
+    {
+        EnsureRelationshipTable();
+        std::string blob = SerializeKeyValueMap(kv);
+        int score = ToIntOrDefault(MapGet(kv, "score"), 0);
+        std::string stance = MapGet(kv, "stance");
+        std::ostringstream sql;
+        sql << "REPLACE INTO `npcchat_relationship` "
+            << "(`player_guid`,`npc_entry`,`player_name`,`npc_name`,`score`,`stance`,`data`) VALUES ("
+            << playerGuidRaw << "," << npcEntry << ",'"
+            << SqlEscape(playerName) << "','" << SqlEscape(npcName) << "',"
+            << score << ",'" << SqlEscape(stance) << "','" << SqlEscape(blob) << "')";
+        WorldDatabase.Execute(sql.str().c_str());
+    }
+
+    std::map<std::string, std::string> LoadRelationshipKV(uint64_t playerGuidRaw, uint32 npcEntry,
+        std::string const& playerName, std::string const& npcName)
+    {
+        EnsureRelationshipTable();
+        if (QueryResult r = WorldDatabase.Query(
+            "SELECT `data` FROM `npcchat_relationship` WHERE `player_guid`={} AND `npc_entry`={} LIMIT 1",
+            playerGuidRaw, npcEntry))
+            return ParseKeyValueText(r->Fetch()[0].Get<std::string>());
+
+        // disk fallback + lazy migrate
+        std::map<std::string, std::string> kv =
+            LoadKeyValueFile(PersonalRelationshipFilePath(playerName, playerGuidRaw, npcName, npcEntry));
+        if (!kv.empty())
+            UpsertRelationshipRow(playerGuidRaw, npcEntry, playerName, npcName, kv);
+        return kv;
+    }
+
+    std::string LoadRelationshipText(uint64_t playerGuidRaw, uint32 npcEntry,
+        std::string const& playerName, std::string const& npcName)
+    {
+        return TrimCopy(SerializeKeyValueMap(
+            LoadRelationshipKV(playerGuidRaw, npcEntry, playerName, npcName)));
+    }
+
+    bool SaveRelationshipKV(uint64_t playerGuidRaw, uint32 npcEntry,
+        std::string const& playerName, std::string const& npcName,
+        std::map<std::string, std::string> const& kv)
+    {
+        UpsertRelationshipRow(playerGuidRaw, npcEntry, playerName, npcName, kv);
+        return WriteKeyValueFile(
+            PersonalRelationshipFilePath(playerName, playerGuidRaw, npcName, npcEntry), kv);
+    }
+
+    void DeleteRelationship(uint64_t playerGuidRaw, uint32 npcEntry)
+    {
+        EnsureRelationshipTable();
+        std::ostringstream sql;
+        sql << "DELETE FROM `npcchat_relationship` WHERE `player_guid`=" << playerGuidRaw
+            << " AND `npc_entry`=" << npcEntry;
+        WorldDatabase.Execute(sql.str().c_str());
+    }
+
+    // Up to `cap` npc_entries this player has a relationship with, newest first (pass-by greeting).
+    std::vector<uint32> GetPlayerRelationshipEntries(uint64_t playerGuidRaw, uint32 cap)
+    {
+        std::vector<uint32> out;
+        EnsureRelationshipTable();
+        std::ostringstream q;
+        q << "SELECT `npc_entry` FROM `npcchat_relationship` WHERE `player_guid`=" << playerGuidRaw
+            << " ORDER BY `updated_at` DESC LIMIT " << cap;
+        if (QueryResult r = WorldDatabase.Query(q.str().c_str()))
+            do { out.push_back(r->Fetch()[0].Get<uint32>()); } while (r->NextRow());
+        return out;
     }
 
     std::string PlayerRaceName(uint8 race)
@@ -1477,9 +2051,11 @@ namespace
             << "(`npc_entry`,`bark_context`,`faction`,`race_id`,`class_id`,`phase`,`text`) VALUES ("
             << req.npcEntry << ","
             << "'" << NpcBarkSqlEscape(context) << "',"
-            << uint32(req.faction) << ","
-            << uint32(req.playerRace) << ","
-            << uint32(req.playerClass) << ","
+            // Universal cache (see SaveQuestBarkCache): 0/0/0 so one bark is reused for everyone and
+            // personalized via placeholders at speak time, instead of regenerating per race/class.
+            << uint32(0) << ","
+            << uint32(0) << ","
+            << uint32(0) << ","
             << uint32(req.phase) << ","
             << "'" << NpcBarkSqlEscape(line) << "')";
         WorldDatabase.Execute(sql.str().c_str());
@@ -1685,7 +2261,7 @@ namespace
 
         {
             std::lock_guard<std::mutex> lock(g_FileMutex);
-            relationship = LoadKeyValueFile(relationshipPath);
+            relationship = LoadRelationshipKV(playerKey, npc->GetEntry(), player->GetName(), npc->GetName());
             barks = LoadKeyValueFile(barksPath);
         }
 
@@ -2434,7 +3010,7 @@ void GeneratePromptWorker(GenPromptRequest req)
         std::lock_guard<std::mutex> lock(g_FileMutex);
         EnsureNpcChatDirectoriesAndDefaultPrompt();
 
-        sharedSubPromptNames = LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry));
+        sharedSubPromptNames = MergeSubPromptNames(LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry)), req.autoTags);
         sharedSubPrompts = LoadSubPromptBlocks(sharedSubPromptNames);
         existingSharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
         existingPersonalPrompt = ReadWholeTextFile(req.outputPath);
@@ -2587,7 +3163,7 @@ void GenerateRelationshipBarksWorker(GenBarkRequest req)
 
         sharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
         personalPrompt = ReadWholeTextFile(PersonalPromptFilePath(req.playerName, req.playerGuidRaw, req.npcName, req.npcEntry));
-        relationshipText = ReadWholeTextFile(PersonalRelationshipFilePath(req.playerName, req.playerGuidRaw, req.npcName, req.npcEntry));
+        relationshipText = LoadRelationshipText(req.playerGuidRaw, req.npcEntry, req.playerName, req.npcName);
         existingBarks = ReadWholeTextFile(req.outputPath);
         personalHistory = LoadHistoryTail(PersonalHistoryFilePath(req.playerName, req.playerGuidRaw, req.npcName, req.npcEntry), std::min(g_PersonalHistoryTail, 10));
     }
@@ -2752,7 +3328,7 @@ void GenerateHostileBarkCacheWorker(GenBarkRequest req)
         std::lock_guard<std::mutex> lock(g_FileMutex);
         EnsureNpcChatDirectoriesAndDefaultPrompt();
         sharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
-        sharedSubPrompts = LoadSubPromptBlocks(LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry)));
+        sharedSubPrompts = LoadSubPromptBlocks(MergeSubPromptNames(LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry)), req.autoTags));
     }
 
     existingBark = LookupNpcBarkCache(req.npcEntry, req.cacheContext, req.faction, req.playerRace, req.playerClass, req.phase);
@@ -2805,7 +3381,11 @@ void GenerateHostileBarkCacheWorker(GenBarkRequest req)
     if (!SaveNpcBarkCache(req, req.cacheContext, generated))
         QueueSystemMessage(req.playerGuidRaw, "NPC Chat hostile SQL bark generation finished but failed to save DB cache row.");
     else
+    {
+        // Generating a hostile bark opts this NPC into aggro-driven speak.
+        SetNpcProfileCanSpeak(req.npcEntry, true, 0);
         QueueSystemMessage(req.playerGuidRaw, "NPC Chat hostile SQL bark saved for " + req.npcName + " entry " + std::to_string(req.npcEntry) + ".");
+    }
 
     ClearNpcBarkGenerationPending(pendingKey);
 }
@@ -2819,7 +3399,7 @@ void GenerateHostileBarksWorker(GenBarkRequest req)
         std::lock_guard<std::mutex> lock(g_FileMutex);
         EnsureNpcChatDirectoriesAndDefaultPrompt();
         sharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
-        sharedSubPrompts = LoadSubPromptBlocks(LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry)));
+        sharedSubPrompts = LoadSubPromptBlocks(MergeSubPromptNames(LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry)), req.autoTags));
         existingBarks = ReadWholeTextFile(req.outputPath);
     }
     if (sharedPrompt.empty() && sharedSubPrompts.empty() && req.extraInstruction.empty())
@@ -2955,7 +3535,23 @@ namespace
         return ids;
     }
 
-    std::vector<uint32> GetNearbyQuestgiverEntriesFromDb(Player const* player, float range, uint32 maxRows)
+    std::vector<uint32> GetNpcEnderQuestIds(uint32 npcEntry)
+    {
+        std::vector<uint32> ids;
+        QueryResult result = WorldDatabase.Query("SELECT `quest` FROM `creature_questender` WHERE `id` = {} ORDER BY `quest`", npcEntry);
+        if (!result)
+            return ids;
+        do
+        {
+            Field* fields = result->Fetch();
+            uint32 q = fields[0].Get<uint32>();
+            if (q && std::find(ids.begin(), ids.end(), q) == ids.end())
+                ids.push_back(q);
+        } while (result->NextRow());
+        return ids;
+    }
+
+    std::vector<uint32> GetNearbyQuestgiverEntriesFromDb(Player const* player, float range, uint32 maxRows, char const* joinTable = "creature_queststarter")
     {
         std::vector<uint32> entries;
         if (!player || maxRows == 0)
@@ -2978,7 +3574,7 @@ namespace
             << "(c.`position_y` - " << y << ") * (c.`position_y` - " << y << ") + "
             << "(c.`position_z` - " << z << ") * (c.`position_z` - " << z << "))) AS `dist2` "
             << "FROM `creature` c "
-            << "INNER JOIN `creature_queststarter` qs ON qs.`id` = c.`id` "
+            << ((joinTable && *joinTable) ? (std::string("INNER JOIN `") + joinTable + "` qs ON qs.`id` = c.`id` ") : std::string())
             << "WHERE c.`map` = " << player->GetMapId() << " "
             << "AND c.`position_x` BETWEEN " << (x - range) << " AND " << (x + range) << " "
             << "AND c.`position_y` BETWEEN " << (y - range) << " AND " << (y + range) << " "
@@ -3053,6 +3649,75 @@ namespace
         return out;
     }
 
+    // Quests this NPC is the ENDER of, that the player is currently on but has NOT yet completed
+    // (objectives unfinished). This is the "did you do it yet?" nudge set. A quest sitting at
+    // QUEST_STATUS_COMPLETE (ready to hand in) is intentionally excluded - that's a different,
+    // happier "you're done, turn it in" line we can add later.
+    std::vector<QuestBarkQuestInfo> GetActiveEnderQuestInfos(Player* player, Creature* npc, uint32 onlyQuestId = 0)
+    {
+        std::vector<QuestBarkQuestInfo> out;
+        if (!player || !npc)
+            return out;
+
+        std::vector<uint32> enderIds = GetNpcEnderQuestIds(npc->GetEntry());
+        for (uint32 questId : enderIds)
+        {
+            if (onlyQuestId && questId != onlyQuestId)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            if (player->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            out.push_back(BuildQuestInfo(quest));
+            if (static_cast<int>(out.size()) >= g_QuestBarksMaxQuestsCheckedPerNpc)
+                break;
+        }
+        return out;
+    }
+
+    // Generation-time quest sets: pulled straight from the NPC's quest tables, ignoring the player's
+    // quest log. The gen commands use these so you can pre-build (or rebuild) barks for quests you've
+    // already taken or already finished. The player only supplies requesting context; the saved cache
+    // row is universal (faction/race/class stored as 0 and personalized at speak time).
+    std::vector<QuestBarkQuestInfo> GetAllNpcStarterQuestInfos(Creature* npc, uint32 onlyQuestId = 0)
+    {
+        std::vector<QuestBarkQuestInfo> out;
+        if (!npc)
+            return out;
+        for (uint32 questId : GetNpcStarterQuestIds(npc->GetEntry()))
+        {
+            if (onlyQuestId && questId != onlyQuestId)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            out.push_back(BuildQuestInfo(quest));
+            if (static_cast<int>(out.size()) >= g_QuestBarksMaxQuestsCheckedPerNpc)
+                break;
+        }
+        return out;
+    }
+
+    std::vector<QuestBarkQuestInfo> GetAllNpcEnderQuestInfos(Creature* npc, uint32 onlyQuestId = 0)
+    {
+        std::vector<QuestBarkQuestInfo> out;
+        if (!npc)
+            return out;
+        for (uint32 questId : GetNpcEnderQuestIds(npc->GetEntry()))
+        {
+            if (onlyQuestId && questId != onlyQuestId)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            out.push_back(BuildQuestInfo(quest));
+            if (static_cast<int>(out.size()) >= g_QuestBarksMaxQuestsCheckedPerNpc)
+                break;
+        }
+        return out;
+    }
+
     std::string BuildQuestKey(std::vector<QuestBarkQuestInfo> quests)
     {
         std::vector<uint32> ids;
@@ -3105,7 +3770,7 @@ namespace
         return 0;
     }
 
-    std::string LookupQuestBarkCache(uint32 npcEntry, std::string const& questKey, uint8 faction, uint8 race, uint8 cls, uint16 phase, uint8 playerLevel)
+    std::string LookupQuestBarkCache(uint32 npcEntry, std::string const& questKey, uint8 faction, uint8 race, uint8 cls, uint16 phase, uint8 playerLevel, std::string const& barkType = "quest_available")
     {
         EnsureQuestBarkCacheTable();
         std::ostringstream sql;
@@ -3113,7 +3778,7 @@ namespace
             << "WHERE `npc_entry`=" << npcEntry
             << " AND `quest_key`='" << SqlEscape(questKey) << "'"
             << " AND `phase` IN (" << phase << ",0)"
-            << " AND `bark_type`='quest_available'"
+            << " AND `bark_type`='" << SqlEscape(barkType) << "'"
             << " AND (`min_level`=0 OR `min_level` <= " << uint32(playerLevel) << ")"
             << " AND (`max_level`=0 OR `max_level` >= " << uint32(playerLevel) << ")"
             << " AND `faction` IN (" << uint32(faction) << ",0)"
@@ -3139,14 +3804,18 @@ namespace
             << req.npcEntry << ","
             << "'" << SqlEscape(req.questKey) << "',"
             << "'" << SqlEscape(QuestIdsString(req.quests)) << "',"
-            << uint32(req.faction) << ","
-            << uint32(req.playerRace) << ","
-            << uint32(req.playerClass) << ","
+            // Universal cache: store 0/0/0 for faction/race/class so ONE bark is reused for every
+            // player and never regenerated per-race. The text uses {race}/{class}/{faction}/{player}
+            // placeholders that ApplyPlayerPlaceholders fills in per viewer at speak time. Quest
+            // acceptability (GetAcceptableQuestInfos) still gates who actually hears it.
+            << uint32(0) << ","
+            << uint32(0) << ","
+            << uint32(0) << ","
             << uint32(req.phase) << ","
             << uint32(req.minLevel) << ","
             << uint32(req.maxLevel) << ","
             << uint32(req.generatedLevel) << ","
-            << "'quest_available',"
+            << "'" << SqlEscape(req.barkType.empty() ? std::string("quest_available") : req.barkType) << "',"
             << "'" << SqlEscape(text) << "')";
         WorldDatabase.Execute(sql.str().c_str());
         return true;
@@ -3161,6 +3830,21 @@ namespace
             "Write one or two short in-character sentences. "
             "Do not mention AI, files, prompts, servers, tokens, quest IDs, gossip windows, SQL, or game mechanics. "
             "Do not summarize the full quest text; hook the player's attention naturally. "
+            "This request is for ONE quest only. Do not blend multiple quests into one bark. "
+            "Use reusable placeholders when useful: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. "
+            "Prefer placeholders over hardcoding the player name, race, or class.";
+    }
+
+    std::string BuildGenerateQuestEnderBarkSystemPrompt()
+    {
+        return
+            "You are creating one reusable cached quest-progress bark for a World of Warcraft questgiver. "
+            "The player is CURRENTLY ON this NPC's quest but has NOT finished it yet, and is walking past. "
+            "The NPC is checking in - essentially asking 'have you done it yet?' - impatient, hopeful, gruff, or encouraging as fits the NPC. "
+            "Return ONLY the spoken line. No markdown, no quotes, no key names. "
+            "Write one or two short in-character sentences. "
+            "Do not give away the solution or summarize the quest; just prod the player about their unfinished task. "
+            "Do not mention AI, files, prompts, servers, tokens, quest IDs, gossip windows, SQL, or game mechanics. "
             "This request is for ONE quest only. Do not blend multiple quests into one bark. "
             "Use reusable placeholders when useful: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. "
             "Prefer placeholders over hardcoding the player name, race, or class.";
@@ -3217,9 +3901,12 @@ namespace
             EnsureNpcChatDirectoriesAndDefaultPrompt();
             sharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
         }
-        existingBark = LookupQuestBarkCache(req.npcEntry, req.questKey, req.faction, req.playerRace, req.playerClass, req.phase, req.playerLevel);
+        existingBark = LookupQuestBarkCache(req.npcEntry, req.questKey, req.faction, req.playerRace, req.playerClass, req.phase, req.playerLevel, req.barkType);
         NpcChat_ApiConfig cfg = BuildGenerationApiConfig(350);
-        NpcChat_LLMResult res = NpcChat_CallLLM(cfg, BuildGenerateQuestBarkSystemPrompt(), BuildGenerateQuestBarkUserPrompt(req, sharedPrompt, existingBark));
+        bool isEnder = (req.barkType == "quest_ender");
+        NpcChat_LLMResult res = NpcChat_CallLLM(cfg,
+            isEnder ? BuildGenerateQuestEnderBarkSystemPrompt() : BuildGenerateQuestBarkSystemPrompt(),
+            BuildGenerateQuestBarkUserPrompt(req, sharedPrompt, existingBark));
         if (!res.success || TrimCopy(res.text).empty())
         {
             if (req.notifyPlayer)
@@ -3250,7 +3937,7 @@ namespace
             QueueSystemMessage(req.playerGuidRaw, "NPC Chat quest bark saved to DB cache for quest key " + req.questKey + ".");
     }
 
-    GenQuestBarkRequest BuildQuestBarkRequest(Player* player, Creature* npc, std::vector<QuestBarkQuestInfo> quests, std::string const& extraInstruction, bool notify)
+    GenQuestBarkRequest BuildQuestBarkRequest(Player* player, Creature* npc, std::vector<QuestBarkQuestInfo> quests, std::string const& extraInstruction, bool notify, std::string const& barkType = "quest_available")
     {
         GenQuestBarkRequest req;
         req.playerGuidRaw = player->GetGUID().GetRawValue();
@@ -3270,6 +3957,8 @@ namespace
         req.questKey = BuildQuestKey(req.quests);
         req.extraInstruction = extraInstruction;
         req.notifyPlayer = notify;
+        req.barkType = barkType;
+        req.autoTags = ResolveCreatureAutoTags(npc);
         if (CreatureTemplate const* ct = npc->GetCreatureTemplate())
         {
             req.npcSubName = ct->SubName;
@@ -3304,7 +3993,7 @@ namespace
         }
     }
 
-    uint32 StartQuestBarkGenerationForEachQuest(ChatHandler* handler, Player* player, Creature* npc, std::vector<QuestBarkQuestInfo> const& quests, std::string const& extraInstruction)
+    uint32 StartQuestBarkGenerationForEachQuest(ChatHandler* handler, Player* player, Creature* npc, std::vector<QuestBarkQuestInfo> const& quests, std::string const& extraInstruction, std::string const& barkType = "quest_available")
     {
         if (!player || !npc || quests.empty())
             return 0;
@@ -3317,7 +4006,7 @@ namespace
             std::vector<QuestBarkQuestInfo> singleQuest;
             singleQuest.push_back(q);
 
-            GenQuestBarkRequest qReq = BuildQuestBarkRequest(player, npc, singleQuest, StripWrappingQuotes(extraInstruction), true);
+            GenQuestBarkRequest qReq = BuildQuestBarkRequest(player, npc, singleQuest, StripWrappingQuotes(extraInstruction), true, barkType);
             if (qReq.questKey.empty())
                 continue;
 
@@ -3486,6 +4175,165 @@ namespace
         if (reason) *reason = selectedQuestKey.empty() ? "Quest bark spoken." : "Quest bark spoken for quest key " + selectedQuestKey + ".";
         return true;
     }
+
+    // ---- Quest ENDER barks: "did you do it yet?" when you pass the turn-in NPC mid-quest ----
+
+    void MaybeGenerateMissingQuestEnderBark(Player* player, Creature* npc, std::vector<QuestBarkQuestInfo> quests)
+    {
+        if (!g_QuestBarksGenerateMissing || quests.empty())
+            return;
+
+        time_t now = std::time(nullptr);
+        for (QuestBarkQuestInfo const& q : quests)
+        {
+            std::vector<QuestBarkQuestInfo> singleQuest;
+            singleQuest.push_back(q);
+
+            GenQuestBarkRequest req = BuildQuestBarkRequest(player, npc, singleQuest, "", false, "quest_ender");
+            if (req.questKey.empty())
+                continue;
+
+            std::string genKey = "ender:" + std::to_string(req.npcEntry) + ":" + req.questKey;
+            if (g_QuestBarkGenerationCooldownUntil[genKey] > now)
+                continue;
+
+            g_QuestBarkGenerationCooldownUntil[genKey] = now + 3600;
+            std::thread(GenerateQuestBarkWorker, std::move(req)).detach();
+        }
+    }
+
+    Creature* FindNearbyQuestEnderForBark(Player* player)
+    {
+        if (!player || !player->IsInWorld() || player->IsInCombat())
+            return nullptr;
+
+        if (Unit* selected = player->GetSelectedUnit())
+        {
+            if (Creature* selectedNpc = selected->ToCreature())
+            {
+                if (selectedNpc->IsInWorld() && selectedNpc->IsAlive() &&
+                    player->IsWithinDist(selectedNpc, g_QuestBarksTriggerDistance, true) &&
+                    !GetActiveEnderQuestInfos(player, selectedNpc).empty())
+                    return selectedNpc;
+            }
+        }
+
+        if (g_QuestBarksSelectedOnly)
+            return nullptr;
+
+        std::vector<uint32> entries = GetNearbyQuestgiverEntriesFromDb(player, g_QuestBarksTriggerDistance, 32, "creature_questender");
+        Creature* best = nullptr;
+        float bestDist = g_QuestBarksTriggerDistance + 1.0f;
+
+        for (uint32 entry : entries)
+        {
+            Creature* candidate = player->FindNearestCreature(entry, g_QuestBarksTriggerDistance, true);
+            if (!candidate || !candidate->IsInWorld() || !candidate->IsAlive())
+                continue;
+            if (!player->IsWithinDist(candidate, g_QuestBarksTriggerDistance, true))
+                continue;
+            if (GetActiveEnderQuestInfos(player, candidate).empty())
+                continue;
+
+            float dist = player->GetDistance(candidate);
+            if (!best || dist < bestDist)
+            {
+                best = candidate;
+                bestDist = dist;
+            }
+        }
+
+        return best;
+    }
+
+    bool SpeakCachedQuestEnderBark(Player* player, Creature* npc, bool bypassChanceAndCooldown, uint32 onlyQuestId = 0, std::string* reason = nullptr)
+    {
+        if (!player || !npc || !npc->IsAlive())
+        {
+            if (reason) *reason = "No valid living NPC target.";
+            return false;
+        }
+        WorldSession* session = player->GetSession();
+        if (!session)
+        {
+            if (reason) *reason = "No player session.";
+            return false;
+        }
+        if (g_QuestBarksRealPlayersOnly && session->IsBot())
+        {
+            if (reason) *reason = "Bots do not trigger quest barks.";
+            return false;
+        }
+        if (!player->IsWithinDist(npc, g_QuestBarksTriggerDistance, true))
+        {
+            if (reason) *reason = "Quest ender is outside quest bark range.";
+            return false;
+        }
+
+        uint64 playerKey = player->GetGUID().GetRawValue();
+        uint64 npcKey = npc->GetGUID().GetRawValue();
+        std::string pairKey = std::to_string(playerKey) + ":questender:" + std::to_string(npc->GetEntry());
+        time_t now = std::time(nullptr);
+
+        if (!bypassChanceAndCooldown)
+        {
+            if (player->IsInCombat()) { if (reason) *reason = "Player is in combat."; return false; }
+            if (g_QuestBarkPlayerCooldownUntil[playerKey] > now) { if (reason) *reason = "Player quest bark cooldown is still active."; return false; }
+            if (g_QuestBarkNpcCooldownUntil[npcKey] > now) { if (reason) *reason = "Quest ender cooldown is still active."; return false; }
+            if (!pairKey.empty() && g_QuestBarkPairCooldownUntil[pairKey] > now) { if (reason) *reason = "Player/quest-ender pair cooldown is still active."; return false; }
+            if (g_QuestBarksChancePct <= 0) { if (reason) *reason = "Quest bark chance is 0."; return false; }
+            if (g_QuestBarksChancePct < 100 && (std::rand() % 100) >= g_QuestBarksChancePct) { if (reason) *reason = "Quest bark chance roll did not pass."; return false; }
+        }
+
+        std::vector<QuestBarkQuestInfo> quests = GetActiveEnderQuestInfos(player, npc, onlyQuestId);
+        if (quests.empty())
+        {
+            if (reason) *reason = onlyQuestId ? "That quest is not currently in progress and ended by this NPC." : "No in-progress quests ended by this NPC for this player.";
+            return false;
+        }
+
+        std::string selectedQuestKey;
+        std::string bark;
+        for (QuestBarkQuestInfo const& q : quests)
+        {
+            std::vector<QuestBarkQuestInfo> singleQuest;
+            singleQuest.push_back(q);
+
+            std::string questKey = BuildQuestKey(singleQuest);
+            if (questKey.empty())
+                continue;
+
+            bark = LookupQuestBarkCache(npc->GetEntry(), questKey, PlayerFactionId(player), player->getRace(), player->getClass(), 0, player->GetLevel(), "quest_ender");
+            if (!bark.empty())
+            {
+                selectedQuestKey = questKey;
+                break;
+            }
+        }
+
+        if (bark.empty())
+        {
+            MaybeGenerateMissingQuestEnderBark(player, npc, quests);
+            if (reason) *reason = g_QuestBarksGenerateMissing ?
+                "No cached quest-ender bark existed. Generation was queued; try again after it saves." :
+                "No cached quest-ender bark exists yet. Target this turn-in NPC and use .npcc gen questender first.";
+            return false;
+        }
+
+        bark = ApplyPlayerPlaceholders(bark, player, npc);
+        npc->Say(bark, LANG_UNIVERSAL);
+
+        if (!bypassChanceAndCooldown)
+        {
+            g_QuestBarkPlayerCooldownUntil[playerKey] = now + std::max(1, g_QuestBarksPlayerCooldownSec);
+            g_QuestBarkNpcCooldownUntil[npcKey] = now + std::max(1, g_QuestBarksNpcCooldownSec);
+            if (!pairKey.empty())
+                g_QuestBarkPairCooldownUntil[pairKey] = now + std::max(1, g_QuestBarksPairCooldownSec);
+        }
+
+        if (reason) *reason = selectedQuestKey.empty() ? "Quest ender bark spoken." : "Quest ender bark spoken for quest key " + selectedQuestKey + ".";
+        return true;
+    }
 }
 
 // ===========================================================================
@@ -3629,8 +4477,8 @@ namespace
             sharedPrompt = ReadWholeTextFile(sharedPromptPath);
             personalSubPrompts = LoadSubPromptBlocks(LoadSubPromptNameList(personalSubPromptListPath));
             personalPrompt = ReadWholeTextFile(personalPromptPath);
-            relationshipText = ReadWholeTextFile(PersonalRelationshipFilePath(
-                req.playerName, req.playerGuidRaw, req.npcName, req.npcEntry));
+            relationshipText = LoadRelationshipText(
+                req.playerGuidRaw, req.npcEntry, req.playerName, req.npcName);
 
             sharedHistory = LoadHistoryTail(sharedPath, g_SharedHistoryTail);
             personalHistory = LoadHistoryTail(personalPath, g_PersonalHistoryTail);
@@ -3664,6 +4512,97 @@ namespace
 
         std::lock_guard<std::mutex> lock(g_ReplyMutex);
         g_ReplyQueue.push(std::move(reply));
+    }
+}
+
+// ===========================================================================
+// Untargeted chat target selection (no NPC selected: who answers a say/yell?)
+// ===========================================================================
+namespace
+{
+    bool MessageSoundsHostile(std::string const& text)
+    {
+        std::string t = ToLowerCopy(text);
+        static const char* words[] = {
+            "die", "kill", "death", "fight", "attack", "coward", "blood", "slay",
+            "destroy", "enemy", "face me", "come here", "you'll pay", "i'll end",
+            "murder", "crush", "burn", "bleed", "weak", "pathetic", "challenge",
+            "duel", "strike", "fear me", "begone", "filth", "scum"
+        };
+        for (char const* w : words)
+            if (t.find(w) != std::string::npos)
+                return true;
+        return false;
+    }
+
+    // No NPC selected: pick one to answer an untargeted say/yell.
+    //  - A yell (or a hostile-sounding line), near hostile creatures, lets the nearest enemy answer.
+    //  - Otherwise the nearest friendly/neutral NPC answers, within normal say range.
+    // Uses the same cheap DB spatial scan as the quest barks (no grid iteration); the "" join table
+    // means "any creature", not just questgivers.
+    Creature* FindUntargetedChatNpc(Player* player, bool isYell, std::string const& text, bool& outHostile)
+    {
+        outHostile = false;
+        if (!player || !player->IsInWorld())
+            return nullptr;
+
+        float sayRange = g_TriggerRange;
+        float yellRange = std::max(sayRange, g_UntargetedYellRange);
+        float scanRange = isYell ? yellRange : sayRange;
+
+        std::vector<uint32> entries = GetNearbyQuestgiverEntriesFromDb(player, scanRange, 48, nullptr);
+        if (entries.empty())
+            return nullptr;
+
+        bool wantHostile = g_UntargetedHostileYellEnabled && g_AllowHostileChat && (isYell || MessageSoundsHostile(text));
+
+        Creature* bestHostile = nullptr;  float bestHostileDist = scanRange + 1.0f;
+        Creature* bestFriendly = nullptr; float bestFriendlyDist = sayRange + 1.0f;
+
+        for (uint32 entry : entries)
+        {
+            Creature* c = player->FindNearestCreature(entry, scanRange, true);
+            if (!c || !c->IsInWorld() || !c->IsAlive())
+                continue;
+
+            float dist = player->GetDistance(c);
+
+            if (c->IsHostileTo(player))
+            {
+                if (!wantHostile || dist > yellRange)
+                    continue;
+
+                std::string type = CreatureTypeStr(c->GetCreatureType());
+                if (type.empty())
+                    if (CreatureTemplate const* ct = c->GetCreatureTemplate())
+                        type = CreatureTypeStr(ct->type);
+                if (!CanSpeakCreatureType(type))
+                    continue;
+
+                if (!bestHostile || dist < bestHostileDist)
+                {
+                    bestHostile = c;
+                    bestHostileDist = dist;
+                }
+            }
+            else
+            {
+                if (dist > sayRange)
+                    continue;
+                if (!bestFriendly || dist < bestFriendlyDist)
+                {
+                    bestFriendly = c;
+                    bestFriendlyDist = dist;
+                }
+            }
+        }
+
+        if (wantHostile && bestHostile)
+        {
+            outHostile = true;
+            return bestHostile;
+        }
+        return bestFriendly;
     }
 }
 
@@ -3722,8 +4661,11 @@ private:
     {
         uint32 relationshipMs = 0;
         uint32 hostileMs = 0;
+        uint32 hostileAggroMs = 0;
+        uint32 relationshipGreetMs = 0;
         uint32 trainerMs = 0;
         uint32 questMs = 0;
+        uint32 questEnderMs = 0;
     };
 
     std::map<ObjectGuid::LowType, PlayerBarkTimers> m_PlayerBarkTimers;
@@ -3796,6 +4738,69 @@ private:
             if (!ok)
                 BarkDebug(player, "quest bark skipped for " + std::string(questNpc->GetName()) + ": " + reason);
         }
+
+        // Quest-ender nudge: walk near the turn-in NPC for a quest you're still working on and it
+        // asks "did you do it yet?". Shares the quest bark toggles/cooldowns and the universal cache.
+        if (g_QuestBarksEnabled && ShouldRunTimer(timers.questEnderMs, diff, g_QuestBarksScanIntervalMs))
+        {
+            if (Creature* enderNpc = FindNearbyQuestEnderForBark(player))
+            {
+                std::string reason;
+                bool ok = SpeakCachedQuestEnderBark(player, enderNpc, false, 0, &reason);
+                if (!ok)
+                    BarkDebug(player, "quest ender bark skipped for " + std::string(enderNpc->GetName()) + ": " + reason);
+            }
+        }
+
+        // Aggro-driven hostile speak: mobs actually attacking the player taunt when they engage.
+        // No grid scan - we read the player's attacker set. Opt-in per NPC via the speak profile
+        // (can_speak), which generating a hostile bark sets automatically.
+        if (g_HostileFirstTalkEnabled && player->IsInCombat() &&
+            ShouldRunTimer(timers.hostileAggroMs, diff, g_HostileFirstTalkScanIntervalMs))
+        {
+            for (Unit* attacker : player->getAttackers())
+            {
+                Creature* foe = attacker ? attacker->ToCreature() : nullptr;
+                if (!foe || !foe->IsInWorld() || !foe->IsHostileTo(player))
+                    continue;
+                if (!NpcProfileCanSpeak(foe->GetEntry()))
+                    continue;
+
+                std::string reason;
+                bool ok = SpeakCachedHostileBark(player, foe, false, &reason);
+                if (!ok)
+                    BarkDebug(player, "hostile aggro bark skipped for " + std::string(foe->GetName()) + ": " + reason);
+                break; // at most one taunt per tick
+            }
+        }
+
+        // Pass-by greeting: an NPC you already have a relationship with greets you when you walk
+        // near it - so the world isn't dead. We pull this player's known NPC entries from SQL and
+        // ask the grid for any spawn of those entries within range in a single call (no grid scan).
+        if (g_RelationshipBarksEnabled &&
+            ShouldRunTimer(timers.relationshipGreetMs, diff, g_RelationshipBarksScanIntervalMs))
+        {
+            std::vector<uint32> knownEntries =
+                GetPlayerRelationshipEntries(player->GetGUID().GetRawValue(), 64);
+            if (!knownEntries.empty())
+            {
+                std::list<Creature*> nearbyKnown;
+                player->GetCreatureListWithEntryInGrid(nearbyKnown, knownEntries, g_RelationshipBarksTriggerDistance);
+                for (Creature* friendNpc : nearbyKnown)
+                {
+                    if (!friendNpc || !friendNpc->IsInWorld() || !friendNpc->IsAlive())
+                        continue;
+                    if (friendNpc->IsHostileTo(player))
+                        continue;
+
+                    std::string reason;
+                    bool ok = SpeakCachedRelationshipBark(player, friendNpc, false, &reason);
+                    if (!ok)
+                        BarkDebug(player, "relationship greeting skipped for " + std::string(friendNpc->GetName()) + ": " + reason);
+                    break; // one greeting per tick
+                }
+            }
+        }
     }
 
     bool HandleNpcChat(Player* player, uint32 type, std::string& msg)
@@ -3804,7 +4809,7 @@ private:
         if (!g_Enable || !player)
             return true;
 
-        if (type != CHAT_MSG_SAY)
+        if (type != CHAT_MSG_SAY && type != CHAT_MSG_YELL)
             return true;
 
         WorldSession* session = player->GetSession();
@@ -3847,6 +4852,15 @@ private:
 
         Unit* sel = player->GetSelectedUnit();
         Creature* npc = sel ? sel->ToCreature() : nullptr;
+
+        // No NPC selected: let a nearby NPC field the say/yell, if enabled. A hostile-sounding yell
+        // near enemies is answered by the nearest enemy; otherwise the nearest friendly NPC answers.
+        if ((!npc || !npc->IsAlive()) && g_UntargetedChatEnabled)
+        {
+            bool untargetedHostile = false;
+            npc = FindUntargetedChatNpc(player, type == CHAT_MSG_YELL, text, untargetedHostile);
+        }
+
         if (!npc || !npc->IsAlive())
             return true;
 
@@ -3894,6 +4908,7 @@ private:
 
         req.gender = GenderStr(npc->getGender());
         req.creatureType = CreatureTypeStr(npc->GetCreatureType());
+        req.autoTags = ResolveCreatureAutoTags(npc);
 
         if (CreatureTemplate const* tmpl = npc->GetCreatureTemplate())
         {
@@ -3948,6 +4963,20 @@ public:
     {
         if (!g_Enable)
             return;
+
+        // One-time disk->SQL sub-prompt import (new rows only). Runs on the main thread after the
+        // DB is up. Force a full re-sync any time with: .npcc sub import overwrite
+        static bool s_subPromptsImported = false;
+        if (!s_subPromptsImported)
+        {
+            s_subPromptsImported = true;
+            if (g_SubPromptImportOnStartup)
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                int imported = ImportSubPromptsFromDisk(false);
+                LOG_INFO("module", "[NpcChat] Sub-prompt disk->SQL import: {} file(s) processed (new rows only).", imported);
+            }
+        }
 
         std::queue<SystemMessage> localSystem;
         {
@@ -4117,6 +5146,7 @@ private:
         req.npcLevel = npc->GetLevel();
         req.gender = GenderStr(npc->getGender());
         req.isHostile = npc->IsHostileTo(player);
+        req.autoTags = ResolveCreatureAutoTags(npc);
 
         if (req.isHostile)
             req.stance = "an enemy";
@@ -4149,15 +5179,18 @@ private:
             handler->PSendSysMessage(".npcc gen preview [quoted extra direction]");
             handler->PSendSysMessage(".npcc quest list");
             handler->PSendSysMessage(".npcc gen quest [questId] [quoted extra direction] - generates separate DB barks per quest");
+            handler->PSendSysMessage(".npcc gen questender [questId] [quoted extra direction] - 'did you do it yet?' barks for in-progress quests");
             handler->PSendSysMessage(".npcc gen bark quest [questId] [quoted extra direction] - same as gen quest");
             handler->PSendSysMessage(".npcc gen bark relationship [quoted extra direction]");
             handler->PSendSysMessage(".npcc gen bark hostile [quoted extra direction]");
             handler->PSendSysMessage(".npcc bark quest [questId]");
+            handler->PSendSysMessage(".npcc bark questender [questId]");
             handler->PSendSysMessage(".npcc bark relationship");
             handler->PSendSysMessage(".npcc bark hostile");
             handler->PSendSysMessage(".npcc hostile status");
             handler->PSendSysMessage("GM: .npcc hostile disable [reason]");
             handler->PSendSysMessage("GM: .npcc hostile enable");
+            handler->PSendSysMessage(".npcc profile show | GM: speak <0|1> | chance <0-100> | kind <k> | tag <csv>");
             handler->PSendSysMessage(".npcc sub list");
             handler->PSendSysMessage(".npcc sub show");
             handler->PSendSysMessage(".npcc sub attach <name>");
@@ -4292,6 +5325,10 @@ private:
             }
 
             std::string path = PersonalRelationshipFilePath(player->GetName(), player->GetGUID().GetRawValue(), npc->GetName(), npc->GetEntry());
+            uint64_t relGuid = player->GetGUID().GetRawValue();
+            uint32 relEntry = npc->GetEntry();
+            std::string relPName = player->GetName();
+            std::string relNName = npc->GetName();
             std::string relRest;
 
             std::lock_guard<std::mutex> lock(g_FileMutex);
@@ -4299,7 +5336,7 @@ private:
 
             if (rest.empty() || StartsWithWord(rest, "show", relRest))
             {
-                std::string current = ReadWholeTextFile(path);
+                std::string current = LoadRelationshipText(relGuid, relEntry, relPName, relNName);
                 handler->PSendSysMessage("NPC Chat relationship file: {}", path.c_str());
                 if (current.empty())
                     handler->PSendSysMessage("No relationship memory exists yet. Use .npcc rel set summary \"...\" or .npcc rel tag <name>.");
@@ -4310,8 +5347,9 @@ private:
 
             if (StartsWithWord(rest, "clear", relRest))
             {
+                DeleteRelationship(relGuid, relEntry);
                 bool removed = RemoveFileIfExists(path);
-                handler->PSendSysMessage(removed ? "NPC Chat relationship memory cleared." : "No relationship memory file existed.");
+                handler->PSendSysMessage(removed ? "NPC Chat relationship memory cleared." : "Relationship memory cleared (SQL).");
                 return true;
             }
 
@@ -4324,7 +5362,7 @@ private:
                     return true;
                 }
 
-                std::map<std::string, std::string> kv = LoadKeyValueFile(path);
+                std::map<std::string, std::string> kv = LoadRelationshipKV(relGuid, relEntry, relPName, relNName);
                 std::vector<std::string> tags = SplitCsvNames(kv["tags"]);
                 if (std::find(tags.begin(), tags.end(), tag) == tags.end())
                     tags.push_back(tag);
@@ -4336,7 +5374,7 @@ private:
                 if (kv.find("stance") == kv.end())
                     kv["stance"] = npc->IsHostileTo(player) ? "hostile" : "neutral";
 
-                if (!WriteKeyValueFile(path, kv))
+                if (!SaveRelationshipKV(relGuid, relEntry, relPName, relNName, kv))
                     handler->PSendSysMessage("Failed to write NPC Chat relationship memory.");
                 else
                     handler->PSendSysMessage("NPC Chat relationship tag added: {}", tag.c_str());
@@ -4352,7 +5390,7 @@ private:
                     return true;
                 }
 
-                std::map<std::string, std::string> kv = LoadKeyValueFile(path);
+                std::map<std::string, std::string> kv = LoadRelationshipKV(relGuid, relEntry, relPName, relNName);
                 kv["summary"] = text;
                 if (kv.find("score") == kv.end())
                     kv["score"] = "0";
@@ -4361,7 +5399,7 @@ private:
                 if (kv.find("stance") == kv.end())
                     kv["stance"] = npc->IsHostileTo(player) ? "hostile" : "neutral";
 
-                if (!WriteKeyValueFile(path, kv))
+                if (!SaveRelationshipKV(relGuid, relEntry, relPName, relNName, kv))
                     handler->PSendSysMessage("Failed to write NPC Chat relationship memory.");
                 else
                     handler->PSendSysMessage("NPC Chat relationship summary saved: {}", path.c_str());
@@ -4391,9 +5429,9 @@ private:
                     return true;
                 }
 
-                std::map<std::string, std::string> kv = LoadKeyValueFile(path);
+                std::map<std::string, std::string> kv = LoadRelationshipKV(relGuid, relEntry, relPName, relNName);
                 kv[key] = value;
-                if (!WriteKeyValueFile(path, kv))
+                if (!SaveRelationshipKV(relGuid, relEntry, relPName, relNName, kv))
                     handler->PSendSysMessage("Failed to write NPC Chat relationship memory.");
                 else
                     handler->PSendSysMessage("NPC Chat relationship {} saved: {}", key.c_str(), path.c_str());
@@ -4425,13 +5463,15 @@ private:
                 barkMode = "hostile";
             else if (StartsWithWord(rest, "trainer", barkRest) || StartsWithWord(rest, "train", barkRest))
                 barkMode = "trainer";
+            else if (StartsWithWord(rest, "questender", barkRest) || StartsWithWord(rest, "ender", barkRest))
+                barkMode = "questender";
             else if (StartsWithWord(rest, "quest", barkRest) || StartsWithWord(rest, "quests", barkRest))
                 barkMode = "quest";
             else if (rest.empty() || StartsWithWord(rest, "relationship", barkRest) || StartsWithWord(rest, "rel", barkRest))
                 barkMode = "relationship";
             else
             {
-                handler->PSendSysMessage("Usage: .npcc bark <relationship|hostile|trainer|quest> [questId]");
+                handler->PSendSysMessage("Usage: .npcc bark <relationship|hostile|trainer|quest|questender> [questId]");
                 return true;
             }
             std::string reason;
@@ -4462,6 +5502,20 @@ private:
                     handler->PSendSysMessage("NPC Chat cached quest bark fired.");
                 else
                     handler->PSendSysMessage("NPC Chat quest bark did not fire: {}", reason.c_str());
+            }
+            else if (barkMode == "questender")
+            {
+                uint32 questId = 0;
+                std::string qText = TrimCopy(barkRest);
+                if (!qText.empty())
+                {
+                    try { questId = static_cast<uint32>(std::stoul(qText)); }
+                    catch (std::exception const&) { questId = 0; }
+                }
+                if (SpeakCachedQuestEnderBark(player, npc, true, questId, &reason))
+                    handler->PSendSysMessage("NPC Chat cached quest-ender bark fired.");
+                else
+                    handler->PSendSysMessage("NPC Chat quest-ender bark did not fire: {}", reason.c_str());
             }
             else
             {
@@ -4510,6 +5564,10 @@ private:
                 g_QuestBarksChancePct,
                 g_QuestBarksTriggerDistance,
                 g_QuestBarksScanIntervalMs);
+            handler->PSendSysMessage("NPC Chat untargeted chat: {} yellRange={} hostileYell={}",
+                g_UntargetedChatEnabled ? "yes" : "no",
+                g_UntargetedYellRange,
+                g_UntargetedHostileYellEnabled ? "yes" : "no");
             return true;
         }
 
@@ -4611,6 +5669,36 @@ private:
             }
 
             std::string questGenRest;
+            if (StartsWithWord(rest, "questender", questGenRest) || StartsWithWord(rest, "ender", questGenRest))
+            {
+                uint32 onlyQuestId = 0;
+                std::string extraQuest = questGenRest;
+                std::string trimmedQuest = TrimCopy(questGenRest);
+                if (!trimmedQuest.empty())
+                {
+                    size_t firstSpace = trimmedQuest.find_first_of(" \t");
+                    std::string maybeId = firstSpace == std::string::npos ? trimmedQuest : trimmedQuest.substr(0, firstSpace);
+                    bool digitsOnly = !maybeId.empty() && std::all_of(maybeId.begin(), maybeId.end(), [](unsigned char c) { return std::isdigit(c); });
+                    if (digitsOnly)
+                    {
+                        onlyQuestId = static_cast<uint32>(std::stoul(maybeId));
+                        extraQuest = firstSpace == std::string::npos ? "" : TrimCopy(trimmedQuest.substr(firstSpace + 1));
+                    }
+                }
+                std::vector<QuestBarkQuestInfo> quests = GetAllNpcEnderQuestInfos(npc, onlyQuestId);
+                if (quests.empty())
+                {
+                    handler->PSendSysMessage(onlyQuestId ?
+                        "NPC Chat quest-ender generation failed: this NPC does not end that quest." :
+                        "NPC Chat quest-ender generation failed: this NPC is not the turn-in NPC for any quest.");
+                    return true;
+                }
+                uint32 started = StartQuestBarkGenerationForEachQuest(handler, player, npc, quests, extraQuest, "quest_ender");
+                if (!started)
+                    handler->PSendSysMessage("NPC Chat quest-ender bark generation did not start.");
+                return true;
+            }
+
             if (StartsWithWord(rest, "quest", questGenRest) || StartsWithWord(rest, "quests", questGenRest))
             {
                 uint32 onlyQuestId = 0;
@@ -4627,17 +5715,25 @@ private:
                         extraQuest = firstSpace == std::string::npos ? "" : TrimCopy(trimmedQuest.substr(firstSpace + 1));
                     }
                 }
-                std::vector<QuestBarkQuestInfo> quests = GetAcceptableQuestInfos(player, npc, onlyQuestId);
-                if (quests.empty())
+                std::vector<QuestBarkQuestInfo> starters = GetAllNpcStarterQuestInfos(npc, onlyQuestId);
+                std::vector<QuestBarkQuestInfo> enders = GetAllNpcEnderQuestInfos(npc, onlyQuestId);
+                if (starters.empty() && enders.empty())
                 {
                     handler->PSendSysMessage(onlyQuestId ?
-                        "NPC Chat quest bark generation failed: that quest is not currently acceptable from this NPC for this player." :
-                        "NPC Chat quest bark generation failed: no currently acceptable quests found on this NPC for this player.");
+                        "NPC Chat quest bark generation failed: this NPC does not start or end that quest." :
+                        "NPC Chat quest bark generation failed: this NPC has no quests to start or end.");
                     return true;
                 }
-                uint32 started = StartQuestBarkGenerationForEachQuest(handler, player, npc, quests, extraQuest);
+                uint32 started = 0;
+                if (!starters.empty())
+                    started += StartQuestBarkGenerationForEachQuest(handler, player, npc, starters, extraQuest, "quest_available");
+                if (!enders.empty())
+                    started += StartQuestBarkGenerationForEachQuest(handler, player, npc, enders, extraQuest, "quest_ender");
                 if (!started)
                     handler->PSendSysMessage("NPC Chat quest bark generation did not start.");
+                else
+                    handler->PSendSysMessage("Generating {} intro + {} ender bark(s) for this NPC. Each saves as its own DB row.",
+                        static_cast<uint32>(starters.size()), static_cast<uint32>(enders.size()));
                 return true;
             }
 
@@ -4679,16 +5775,21 @@ private:
                         }
                     }
 
-                    std::vector<QuestBarkQuestInfo> quests = GetAcceptableQuestInfos(player, npc, onlyQuestId);
-                    if (quests.empty())
+                    std::vector<QuestBarkQuestInfo> starters = GetAllNpcStarterQuestInfos(npc, onlyQuestId);
+                    std::vector<QuestBarkQuestInfo> enders = GetAllNpcEnderQuestInfos(npc, onlyQuestId);
+                    if (starters.empty() && enders.empty())
                     {
                         handler->PSendSysMessage(onlyQuestId ?
-                            "NPC Chat quest bark generation failed: that quest is not currently acceptable from this NPC for this player." :
-                            "NPC Chat quest bark generation failed: no currently acceptable quests found on this NPC for this player.");
+                            "NPC Chat quest bark generation failed: this NPC does not start or end that quest." :
+                            "NPC Chat quest bark generation failed: this NPC has no quests to start or end.");
                         return true;
                     }
 
-                    uint32 started = StartQuestBarkGenerationForEachQuest(handler, player, npc, quests, extraQuest);
+                    uint32 started = 0;
+                    if (!starters.empty())
+                        started += StartQuestBarkGenerationForEachQuest(handler, player, npc, starters, extraQuest, "quest_available");
+                    if (!enders.empty())
+                        started += StartQuestBarkGenerationForEachQuest(handler, player, npc, enders, extraQuest, "quest_ender");
                     if (!started)
                         handler->PSendSysMessage("NPC Chat quest bark generation did not start.");
                     return true;
@@ -4835,6 +5936,91 @@ private:
             return true;
         }
 
+        if (StartsWithWord(arg, "profile", rest))
+        {
+            Player* player = GetCommandPlayer(handler);
+            if (!player)
+            {
+                handler->PSendSysMessage("This command must be used in game.");
+                return true;
+            }
+
+            Creature* npc = GetSelectedCreature(handler);
+            if (!npc)
+            {
+                handler->PSendSysMessage("Select an NPC first.");
+                return true;
+            }
+
+            uint32 entry = npc->GetEntry();
+            std::string pRest;
+
+            if (rest.empty() || StartsWithWord(rest, "show", pRest) || StartsWithWord(rest, "help", pRest))
+            {
+                NpcProfile p = LoadNpcProfile(entry);
+                handler->PSendSysMessage("Profile for {} (entry {}):", npc->GetName().c_str(), entry);
+                handler->PSendSysMessage("  can_speak={} speak_chance={} kind={}",
+                    p.canSpeak, p.speakChance, p.kind.empty() ? "auto" : p.kind.c_str());
+                handler->PSendSysMessage("  tags: {}", p.tags.empty() ? "(none)" : p.tags.c_str());
+                handler->PSendSysMessage("Edit (GM/allowed): .npcc profile speak <0|1> | chance <0-100> | kind <quest|regular|hostile|auto> | tag <csv>");
+                return true;
+            }
+
+            // All edits below change shared, all-spawn data -> gate like global sub-prompt creation.
+            if (!CanCreateSubPrompts(handler))
+            {
+                handler->PSendSysMessage("Only GMs or configured NPC Chat creator accounts may edit NPC profiles.");
+                return true;
+            }
+
+            uint32 acct = player->GetSession() ? player->GetSession()->GetAccountId() : 0;
+
+            if (StartsWithWord(rest, "speak", pRest))
+            {
+                std::string v = TrimCopy(pRest);
+                bool on = (v == "1" || ToLowerCopy(v) == "on" || ToLowerCopy(v) == "yes" || ToLowerCopy(v) == "true");
+                SetNpcProfileCanSpeak(entry, on, acct);
+                handler->PSendSysMessage("Profile can_speak set to {} for entry {}.", on ? 1 : 0, entry);
+                return true;
+            }
+
+            if (StartsWithWord(rest, "chance", pRest))
+            {
+                int n = 0;
+                try { n = std::stoi(TrimCopy(pRest)); }
+                catch (...) { n = 0; }
+                if (n < 0) n = 0;
+                if (n > 100) n = 100;
+                UpsertNpcProfileField(entry, "speak_chance", std::to_string(n), acct);
+                handler->PSendSysMessage("Profile speak_chance set to {} for entry {} (0 = use global default).", n, entry);
+                return true;
+            }
+
+            if (StartsWithWord(rest, "kind", pRest))
+            {
+                std::string k = ToLowerCopy(TrimCopy(pRest));
+                if (k != "quest" && k != "regular" && k != "hostile" && k != "auto")
+                {
+                    handler->PSendSysMessage("kind must be one of: quest, regular, hostile, auto.");
+                    return true;
+                }
+                UpsertNpcProfileField(entry, "npc_kind", "'" + SqlEscape(k) + "'", acct);
+                handler->PSendSysMessage("Profile kind set to {} for entry {}.", k.c_str(), entry);
+                return true;
+            }
+
+            if (StartsWithWord(rest, "tag", pRest))
+            {
+                std::string csv = TrimCopy(pRest);
+                UpsertNpcProfileField(entry, "tags", "'" + SqlEscape(csv) + "'", acct);
+                handler->PSendSysMessage("Profile tags set to '{}' for entry {}. These feed the auto-linker (e.g. dwarf,bronzebeard).", csv.c_str(), entry);
+                return true;
+            }
+
+            handler->PSendSysMessage("Unknown .npcc profile subcommand. Try: show | speak | chance | kind | tag");
+            return true;
+        }
+
         if (StartsWithWord(arg, "sub", rest))
         {
             Player* player = GetCommandPlayer(handler);
@@ -4850,6 +6036,9 @@ private:
             {
                 handler->PSendSysMessage("NPC Chat sub-prompt commands:");
                 handler->PSendSysMessage(".npcc sub list");
+                handler->PSendSysMessage(".npcc sub auto   (preview auto-linked sub-prompts for the selected NPC)");
+                handler->PSendSysMessage(".npcc sub import   (disk -> SQL, new rows only)");
+                handler->PSendSysMessage("GM: .npcc sub import overwrite   (force full disk -> SQL re-sync)");
                 handler->PSendSysMessage(".npcc sub show");
                 handler->PSendSysMessage(".npcc sub attach <name>");
                 handler->PSendSysMessage(".npcc sub detach <name>");
@@ -4892,6 +6081,45 @@ private:
 
                 std::sort(names.begin(), names.end());
                 handler->PSendSysMessage("NPC Chat available sub-prompts: {}", JoinNames(names).c_str());
+                return true;
+            }
+
+            if (StartsWithWord(rest, "auto", subRest))
+            {
+                Creature* npc = GetSelectedCreature(handler);
+                if (!npc)
+                {
+                    handler->PSendSysMessage("Select an NPC first to preview its auto-linked sub-prompts.");
+                    return true;
+                }
+
+                std::string tags = ResolveCreatureAutoTags(npc);
+                std::vector<std::string> matched = MatchSubPromptNamesForTags(tags);
+                handler->PSendSysMessage("Auto-linker for {} (entry {}):", npc->GetName().c_str(), npc->GetEntry());
+                handler->PSendSysMessage("  tags: {}", tags.empty() ? "(none)" : tags.c_str());
+                handler->PSendSysMessage("  matched sub-prompts: {}", matched.empty() ? "(none)" : JoinNames(matched).c_str());
+                return true;
+            }
+
+            if (StartsWithWord(rest, "import", subRest))
+            {
+                bool overwrite = false;
+                std::string ov;
+                if (StartsWithWord(subRest, "overwrite", ov))
+                {
+                    if (!IsGm(handler))
+                    {
+                        handler->PSendSysMessage("Only GMs may force-overwrite SQL sub-prompts from disk. Use .npcc sub import (new-only) instead.");
+                        return true;
+                    }
+                    overwrite = true;
+                }
+
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                EnsureNpcChatDirectoriesAndDefaultPrompt();
+                int imported = ImportSubPromptsFromDisk(overwrite);
+                handler->PSendSysMessage("NPC Chat imported {} disk sub-prompt(s) into SQL{}.",
+                    imported, overwrite ? " (overwrite/full re-sync)" : " (new rows only)");
                 return true;
             }
 

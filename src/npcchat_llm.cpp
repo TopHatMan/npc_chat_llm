@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <regex>
@@ -34,9 +35,10 @@ static std::string Trim(std::string s)
 
 // One synchronous POST to {baseUrl}/chat/completions. Returns body or "".
 static std::string HttpPost(const std::string& url,
-                            const std::string& body,
-                            const std::string& apiKey,
-                            int timeoutSec)
+    const std::string& body,
+    const std::string& apiKey,
+    int timeoutSec,
+    bool verifyCert)
 {
     try
     {
@@ -46,8 +48,8 @@ static std::string HttpPost(const std::string& url,
             return "";
 
         std::string proto = m[1].str();
-        std::string host  = m[2].str();
-        std::string path  = m[4].matched ? m[4].str() : "/";
+        std::string host = m[2].str();
+        std::string path = m[4].matched ? m[4].str() : "/";
         int port = proto == "https" ? 443 : 80;
         if (m[3].matched) port = std::stoi(m[3].str());
 
@@ -63,7 +65,7 @@ static std::string HttpPost(const std::string& url,
         {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
             httplib::SSLClient cli(host, port);
-            cli.enable_server_certificate_verification(false);
+            cli.enable_server_certificate_verification(verifyCert);
             cli.set_connection_timeout(timeoutSec);
             cli.set_read_timeout(timeoutSec);
             cli.set_write_timeout(timeoutSec);
@@ -92,10 +94,28 @@ static std::string HttpPost(const std::string& url,
 }
 
 NpcChat_LLMResult NpcChat_CallLLM(const NpcChat_ApiConfig& cfg,
-                                  const std::string& systemPrompt,
-                                  const std::string& userPrompt)
+    const std::string& systemPrompt,
+    const std::string& userPrompt)
 {
     NpcChat_LLMResult result;
+
+    // Bound the number of simultaneous LLM calls across all worker threads. Prevents a crowd of
+    // players near NPCs from spawning unbounded concurrent OpenRouter requests (cost + sockets).
+    static std::atomic<int> s_inFlight{ 0 };
+    struct InFlightGuard
+    {
+        bool acquired = false;
+        ~InFlightGuard() { if (acquired) s_inFlight.fetch_sub(1, std::memory_order_relaxed); }
+    } guard;
+    if (cfg.maxConcurrent > 0)
+    {
+        if (s_inFlight.fetch_add(1, std::memory_order_relaxed) + 1 > cfg.maxConcurrent)
+        {
+            s_inFlight.fetch_sub(1, std::memory_order_relaxed);
+            return result; // at capacity; caller treats !success as "try later"
+        }
+        guard.acquired = true;
+    }
 
     std::string url = cfg.baseUrl;
     if (!url.empty() && url.back() == '/')
@@ -103,7 +123,7 @@ NpcChat_LLMResult NpcChat_CallLLM(const NpcChat_ApiConfig& cfg,
     url += "/chat/completions";
 
     json body;
-    body["model"]       = cfg.model;
+    body["model"] = cfg.model;
     body["temperature"] = cfg.temperature;
     if (cfg.maxTokens > 0)
         body["max_tokens"] = cfg.maxTokens;
@@ -114,19 +134,25 @@ NpcChat_LLMResult NpcChat_CallLLM(const NpcChat_ApiConfig& cfg,
     messages.push_back({ {"role", "user"}, {"content", userPrompt} });
     body["messages"] = messages;
 
-    std::string bodyStr = body.dump();
-
-    // Splice in raw extra params (single quotes -> double), same trick as PBC.
+    // Merge raw extra params (single quotes -> double) as real JSON instead of string-splicing,
+    // so an apostrophe inside a value can't corrupt the request body. Malformed params are ignored.
     if (!cfg.extraParams.empty())
     {
         std::string extra = cfg.extraParams;
         std::replace(extra.begin(), extra.end(), '\'', '"');
-        if (!bodyStr.empty() && bodyStr.back() == '}')
+        try
         {
-            bodyStr.pop_back();
-            bodyStr += "," + extra + "}";
+            json extraJson = json::parse("{" + extra + "}");
+            for (auto it = extraJson.begin(); it != extraJson.end(); ++it)
+                body[it.key()] = it.value();
+        }
+        catch (const std::exception&)
+        {
+            // ignore malformed extra params rather than send a broken body
         }
     }
+
+    std::string bodyStr = body.dump();
 
     constexpr int MAX_ATTEMPTS = 2;
     for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt)
@@ -134,7 +160,7 @@ NpcChat_LLMResult NpcChat_CallLLM(const NpcChat_ApiConfig& cfg,
         if (attempt > 1)
             std::this_thread::sleep_for(std::chrono::seconds(2));
 
-        std::string resp = HttpPost(url, bodyStr, cfg.apiKey, cfg.timeoutSec);
+        std::string resp = HttpPost(url, bodyStr, cfg.apiKey, cfg.timeoutSec, cfg.verifyCert);
         if (resp.empty())
             continue;
 
@@ -156,7 +182,7 @@ NpcChat_LLMResult NpcChat_CallLLM(const NpcChat_ApiConfig& cfg,
                 if (c == '\n' || c == '\r') c = ' ';
 
             result.success = true;
-            result.text    = Trim(text);
+            result.text = Trim(text);
             return result;
         }
         catch (const std::exception&)
