@@ -205,3 +205,7 @@ NpcChat.GenAutoSubPromptDebug = 1
 # Treat *.npc.prompt and *.relationship.prompt files as relationship/world context,
 # not as identity replacement.
 NpcChat.GenAutoRelationshipPrompts = 1
+
+NpcChat.UntargetedChat.Enable = 1
+NpcChat.UntargetedChat.YellRange = 50
+NpcChat.UntargetedChat.HostileYell = 1

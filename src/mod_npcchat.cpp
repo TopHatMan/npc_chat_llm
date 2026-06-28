@@ -3934,7 +3934,8 @@ namespace
             return;
         }
         if (req.notifyPlayer)
-            QueueSystemMessage(req.playerGuidRaw, "NPC Chat quest bark saved to DB cache for quest key " + req.questKey + ".");
+            QueueSystemMessage(req.playerGuidRaw, "NPC Chat " + std::string(req.barkType == "quest_ender" ? "quest-ender" : "quest intro") +
+                " bark saved to DB cache for quest key " + req.questKey + ".");
     }
 
     GenQuestBarkRequest BuildQuestBarkRequest(Player* player, Creature* npc, std::vector<QuestBarkQuestInfo> quests, std::string const& extraInstruction, bool notify, std::string const& barkType = "quest_available")
@@ -5693,9 +5694,11 @@ private:
                         "NPC Chat quest-ender generation failed: this NPC is not the turn-in NPC for any quest.");
                     return true;
                 }
-                uint32 started = StartQuestBarkGenerationForEachQuest(handler, player, npc, quests, extraQuest, "quest_ender");
+                uint32 started = StartQuestBarkGenerationForEachQuest(nullptr, player, npc, quests, extraQuest, "quest_ender");
                 if (!started)
-                    handler->PSendSysMessage("NPC Chat quest-ender bark generation did not start.");
+                    handler->PSendSysMessage("NPC Chat quest-ender bark generation did not start (no valid quest keys).");
+                else
+                    handler->PSendSysMessage("Quest-ender bark generation queued: {} quest(s). These generate asynchronously and save in a few seconds - you will get a 'saved to DB cache' confirmation per quest.", started);
                 return true;
             }
 
@@ -5724,16 +5727,16 @@ private:
                         "NPC Chat quest bark generation failed: this NPC has no quests to start or end.");
                     return true;
                 }
-                uint32 started = 0;
-                if (!starters.empty())
-                    started += StartQuestBarkGenerationForEachQuest(handler, player, npc, starters, extraQuest, "quest_available");
-                if (!enders.empty())
-                    started += StartQuestBarkGenerationForEachQuest(handler, player, npc, enders, extraQuest, "quest_ender");
+                uint32 introStarted = starters.empty() ? 0u :
+                    StartQuestBarkGenerationForEachQuest(nullptr, player, npc, starters, extraQuest, "quest_available");
+                uint32 enderStarted = enders.empty() ? 0u :
+                    StartQuestBarkGenerationForEachQuest(nullptr, player, npc, enders, extraQuest, "quest_ender");
+                uint32 started = introStarted + enderStarted;
                 if (!started)
-                    handler->PSendSysMessage("NPC Chat quest bark generation did not start.");
+                    handler->PSendSysMessage("NPC Chat quest bark generation did not start (no valid quest keys).");
                 else
-                    handler->PSendSysMessage("Generating {} intro + {} ender bark(s) for this NPC. Each saves as its own DB row.",
-                        static_cast<uint32>(starters.size()), static_cast<uint32>(enders.size()));
+                    handler->PSendSysMessage("Quest bark generation queued: {} intro + {} ender. These generate asynchronously and save in a few seconds - you will get a 'saved to DB cache' confirmation per quest.",
+                        introStarted, enderStarted);
                 return true;
             }
 
@@ -5785,13 +5788,16 @@ private:
                         return true;
                     }
 
-                    uint32 started = 0;
-                    if (!starters.empty())
-                        started += StartQuestBarkGenerationForEachQuest(handler, player, npc, starters, extraQuest, "quest_available");
-                    if (!enders.empty())
-                        started += StartQuestBarkGenerationForEachQuest(handler, player, npc, enders, extraQuest, "quest_ender");
+                    uint32 introStarted = starters.empty() ? 0u :
+                        StartQuestBarkGenerationForEachQuest(nullptr, player, npc, starters, extraQuest, "quest_available");
+                    uint32 enderStarted = enders.empty() ? 0u :
+                        StartQuestBarkGenerationForEachQuest(nullptr, player, npc, enders, extraQuest, "quest_ender");
+                    uint32 started = introStarted + enderStarted;
                     if (!started)
-                        handler->PSendSysMessage("NPC Chat quest bark generation did not start.");
+                        handler->PSendSysMessage("NPC Chat quest bark generation did not start (no valid quest keys).");
+                    else
+                        handler->PSendSysMessage("Quest bark generation queued: {} intro + {} ender. These generate asynchronously and save in a few seconds - you will get a 'saved to DB cache' confirmation per quest.",
+                            introStarted, enderStarted);
                     return true;
                 }
                 else if (!genKindRest.empty())
