@@ -23,6 +23,9 @@
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"     // quests / templates
 #include "QuestDef.h"      // Quest accessors
+#include "Trainer.h"       // Trainer::Trainer / Trainer::Spell (spell-aware trainer barks)
+#include "SpellMgr.h"      // sSpellMgr
+#include "SpellInfo.h"     // SpellInfo / spell names
 #include "DatabaseEnv.h"   // WorldDatabase query/cache
 #include "Config.h"
 #include "SharedDefines.h"   // CHAT_MSG_SAY, LANG_UNIVERSAL, CreatureType, ranks
@@ -413,6 +416,7 @@ namespace
         bool        forcePrivateReply = false;
 
         std::string autoTags;         // auto-linker: resolved creature archetype tags (CSV)
+        std::string trainerInfo;      // if a trainer: leveled list of teachable spells (for conversation)
         std::string message;
     };
 
@@ -457,6 +461,7 @@ namespace
 
         std::string mode;             // shared, personal, preview
         std::string autoTags;         // auto-linker: resolved creature archetype tags (CSV)
+        std::string trainerInfo;      // if a trainer: leveled curriculum baked into the generated identity
         std::string extraInstruction;
         std::string outputPath;
     };
@@ -2581,6 +2586,147 @@ namespace
         return false;
     }
 
+    struct LearnableSpell
+    {
+        uint32 spellId = 0;
+        uint32 reqLevel = 0;
+        std::string name;
+    };
+
+    std::string TrainerSpellName(uint32 spellId)
+    {
+        if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+            if (si->SpellName[0] && *si->SpellName[0])
+                return si->SpellName[0];
+        return "";
+    }
+
+    // Spells the targeted trainer can teach this player RIGHT NOW. Uses the core's own eligibility
+    // (class/profession/skill/level/already-known) via Trainer::CanTeachSpell, so it matches exactly
+    // what the real trainer window would offer.
+    std::vector<LearnableSpell> GetLearnableTrainerSpells(Player* player, Creature* npc)
+    {
+        std::vector<LearnableSpell> out;
+        if (!player || !npc)
+            return out;
+
+        Trainer::Trainer const* trainer = sObjectMgr->GetTrainer(npc->GetEntry());
+        if (!trainer || !trainer->IsTrainerValidForPlayer(player))
+            return out;
+
+        for (Trainer::Spell const& s : trainer->GetSpells())
+        {
+            if (!trainer->CanTeachSpell(player, &s))
+                continue;
+
+            LearnableSpell ls;
+            ls.spellId = s.SpellId;
+            ls.reqLevel = s.ReqLevel;
+            ls.name = TrainerSpellName(s.SpellId);
+            if (ls.name.empty())
+                ls.name = "a new skill";
+            out.push_back(ls);
+        }
+        return out;
+    }
+
+    // The single most interesting spell to mention: the highest required level the player has just
+    // qualified for (the newest unlock), ties broken by lowest spell id for stability.
+    LearnableSpell PickTrainerSpellToMention(std::vector<LearnableSpell> const& spells)
+    {
+        LearnableSpell best;
+        bool have = false;
+        for (LearnableSpell const& s : spells)
+        {
+            if (!have || s.reqLevel > best.reqLevel ||
+                (s.reqLevel == best.reqLevel && s.spellId < best.spellId))
+            {
+                best = s;
+                have = true;
+            }
+        }
+        return best;
+    }
+
+    std::string TrainerTypeName(Creature* npc)
+    {
+        if (npc)
+            if (Trainer::Trainer const* trainer = sObjectMgr->GetTrainer(npc->GetEntry()))
+            {
+                switch (trainer->GetTrainerType())
+                {
+                case Trainer::Type::Class:      return "class trainer";
+                case Trainer::Type::Mount:      return "riding trainer";
+                case Trainer::Type::Tradeskill: return "profession trainer";
+                case Trainer::Type::Pet:        return "pet trainer";
+                default: break;
+                }
+            }
+        return "trainer";
+    }
+
+    // A compact, leveled description of everything this trainer teaches, for feeding to the AI so it
+    // can hold a real training conversation. Trainers teach a LOT, so when focusPlayerLevel is set we
+    // list a window around the player's level (what they can train now or soon) and summarize the rest
+    // as a count; with it off we list the whole curriculum (capped) for static prompt generation.
+    std::string BuildTrainerCurriculumText(Creature* npc, Player* player, bool focusPlayerLevel)
+    {
+        Trainer::Trainer const* trainer = npc ? sObjectMgr->GetTrainer(npc->GetEntry()) : nullptr;
+        if (!trainer)
+            return "";
+
+        struct Entry { uint32 level; std::string name; };
+        std::vector<Entry> all;
+        for (Trainer::Spell const& s : trainer->GetSpells())
+        {
+            std::string n = TrainerSpellName(s.SpellId);
+            if (n.empty())
+                continue;
+            all.push_back({ uint32(s.ReqLevel), n });
+        }
+        if (all.empty())
+            return "";
+
+        std::sort(all.begin(), all.end(), [](Entry const& a, Entry const& b)
+            {
+                if (a.level != b.level) return a.level < b.level;
+                return a.name < b.name;
+            });
+
+        uint32 plevel = player ? player->GetLevel() : 0;
+        int low = focusPlayerLevel ? std::max(0, int(plevel) - 6) : 0;
+        int high = focusPlayerLevel ? int(plevel) + 8 : 100000;
+        uint32 minLvl = all.front().level;
+        uint32 maxLvl = all.back().level;
+
+        std::map<uint32, std::vector<std::string>> byLevel;
+        size_t listed = 0;
+        size_t omitted = 0;
+        for (Entry const& e : all)
+        {
+            if (focusPlayerLevel && (int(e.level) < low || int(e.level) > high)) { ++omitted; continue; }
+            if (listed >= 30) { ++omitted; continue; }
+            byLevel[e.level].push_back(e.name);
+            ++listed;
+        }
+
+        std::ostringstream ss;
+        for (auto const& kv : byLevel)
+        {
+            ss << "- " << (kv.first == 0 ? std::string("Basic") : ("Level " + std::to_string(kv.first))) << ": ";
+            for (size_t i = 0; i < kv.second.size(); ++i)
+            {
+                if (i) ss << ", ";
+                ss << kv.second[i];
+            }
+            ss << "\n";
+        }
+        if (omitted)
+            ss << "- (and " << omitted << " more abilities ranging from level " << minLvl << " to " << maxLvl << ")\n";
+
+        return TrimCopy(ss.str());
+    }
+
     std::string TrainerPairKey(Player const* player, Creature const* npc)
     {
         if (!player || !npc)
@@ -2691,6 +2837,85 @@ namespace
                 g_TrainerBarkPairCooldownUntil[pairKey] = now + std::max(1, g_TrainerBarksPairCooldownSec);
         }
         if (reason) *reason = "Trainer bark spoken.";
+        return true;
+    }
+
+    // Spell-aware trainer bark: greets the player about an actual spell/skill they can learn here now.
+    // The cached line is universal and uses a {spell} placeholder filled at speak time, so one
+    // generated bark serves every eligible player and every spell. Cache-only (pre-generate first).
+    bool SpeakCachedTrainerSpellBark(Player* player, Creature* npc, bool bypassChanceAndCooldown, std::string* reason = nullptr)
+    {
+        if (!player || !npc || !npc->IsAlive())
+        {
+            if (reason) *reason = "No valid living NPC target.";
+            return false;
+        }
+        WorldSession* session = player->GetSession();
+        if (!session)
+        {
+            if (reason) *reason = "No player session.";
+            return false;
+        }
+        if (g_TrainerBarksRealPlayersOnly && session->IsBot())
+        {
+            if (reason) *reason = "Bots do not trigger trainer barks.";
+            return false;
+        }
+        if (!IsTrainerNpc(npc))
+        {
+            if (reason) *reason = "Target NPC is not a trainer.";
+            return false;
+        }
+        if (!player->IsWithinDist(npc, g_TrainerBarksTriggerDistance, true))
+        {
+            if (reason) *reason = "Target trainer is outside trainer bark range.";
+            return false;
+        }
+
+        std::vector<LearnableSpell> learnable = GetLearnableTrainerSpells(player, npc);
+        if (learnable.empty())
+        {
+            if (reason) *reason = "Player has nothing new to learn from this trainer right now.";
+            return false;
+        }
+
+        time_t now = std::time(nullptr);
+        uint64_t playerKey = player->GetGUID().GetRawValue();
+        uint64_t npcKey = npc->GetGUID().GetRawValue();
+        std::string pairKey = TrainerPairKey(player, npc);
+        if (!bypassChanceAndCooldown)
+        {
+            if (player->IsInCombat()) { if (reason) *reason = "Player is in combat."; return false; }
+            if (g_TrainerBarkPlayerCooldownUntil[playerKey] > now) { if (reason) *reason = "Player trainer bark cooldown is still active."; return false; }
+            if (g_TrainerBarkNpcCooldownUntil[npcKey] > now) { if (reason) *reason = "Trainer NPC cooldown is still active."; return false; }
+            if (!pairKey.empty() && g_TrainerBarkPairCooldownUntil[pairKey] > now) { if (reason) *reason = "Player/trainer pair cooldown is still active."; return false; }
+            if (g_TrainerBarksChancePct <= 0) { if (reason) *reason = "Chance is set to 0."; return false; }
+            if (g_TrainerBarksChancePct < 100 && (std::rand() % 100) >= g_TrainerBarksChancePct) { if (reason) *reason = "Chance roll did not fire."; return false; }
+        }
+
+        uint8 faction = NpcChatFactionId(player);
+        uint16 phase = NpcChatProgressionPhase();
+        std::string bark = LookupNpcBarkCache(npc->GetEntry(), "trainer_spell", faction, player->getRace(), player->getClass(), phase);
+        if (bark.empty())
+        {
+            if (reason) *reason = "No cached trainer-spell bark exists. Use .npcc gen bark trainerspell first.";
+            return false;
+        }
+
+        LearnableSpell chosen = PickTrainerSpellToMention(learnable);
+        ReplaceAllInPlace(bark, "{spell}", chosen.name);
+        ReplaceAllInPlace(bark, "{spell_level}", std::to_string(chosen.reqLevel));
+        bark = ApplyPlayerPlaceholders(bark, player, npc);
+        npc->Say(bark, LANG_UNIVERSAL);
+
+        if (!bypassChanceAndCooldown)
+        {
+            g_TrainerBarkPlayerCooldownUntil[playerKey] = now + std::max(1, g_TrainerBarksPlayerCooldownSec);
+            g_TrainerBarkNpcCooldownUntil[npcKey] = now + std::max(1, g_TrainerBarksNpcCooldownSec);
+            if (!pairKey.empty())
+                g_TrainerBarkPairCooldownUntil[pairKey] = now + std::max(1, g_TrainerBarksPairCooldownSec);
+        }
+        if (reason) *reason = "Trainer-spell bark spoken (" + chosen.name + ").";
         return true;
     }
 }
@@ -2863,6 +3088,14 @@ namespace
             ss << "\nIf the relationship stance, score, tags, or summary indicate distrust, resentment, hostility, affection, familiarity, or fear, let that personal attitude noticeably color the NPC's tone while still preserving the NPC's core public identity.";
         }
 
+        if (!req.trainerInfo.empty())
+        {
+            ss << "\n\nYou are a trainer. These are abilities you can personally teach, and the level a student must reach for each:\n";
+            ss << req.trainerInfo;
+            ss << "\nThis list is centered on the current student's level. If they ask what they can learn or train, answer from it naturally - name specific abilities and the levels they unlock, point out what they're ready for now, and tease what's coming soon.";
+            ss << "\nSpeak as a mentor, not a menu: do not dump the whole list at once, and do not invent abilities that are not listed.";
+        }
+
         return ss.str();
     }
 
@@ -2984,6 +3217,13 @@ std::string BuildGenerateCharacterUserPrompt(GenPromptRequest const& req,
     {
         ss << "\nExisting personal prompt, if improving/replacing it:\n";
         ss << existingPersonalPrompt << "\n";
+    }
+
+    if (!req.trainerInfo.empty())
+    {
+        ss << "\nThis NPC is a trainer. Abilities they can teach, by level:\n";
+        ss << req.trainerInfo << "\n";
+        ss << "Weave this expertise into their identity - what they take pride in teaching, how they speak about the craft, what they expect of students - but do NOT just list the abilities verbatim.\n";
     }
 
     if (!req.extraInstruction.empty())
@@ -3388,6 +3628,74 @@ void GenerateHostileBarkCacheWorker(GenBarkRequest req)
     }
 
     ClearNpcBarkGenerationPending(pendingKey);
+}
+
+std::string BuildGenerateTrainerSpellBarkSystemPrompt()
+{
+    return
+        "You are writing ONE short, reusable in-character line for a World of Warcraft trainer who has just noticed a nearby student is ready to learn a new ability. "
+        "Use the literal placeholder {spell} exactly where the ability's name should appear - do NOT invent or name a specific spell yourself. You may also use {spell_level} for its level. "
+        "Return ONLY the spoken line. No quotes, no markdown, no key names, no JSON. One or two short sentences, under about 25 words. "
+        "Sound like a proud, eager, or gruff mentor as fits the trainer. Do not mention AI, files, prompts, servers, gold cost, trainer windows, menus, SQL, or game mechanics. "
+        "Other placeholders you may use: {player}, {race}, {class}, {level}, {faction}, {npc}, {zone}, {sir_miss}. Prefer placeholders over hardcoding. "
+        "Example shape: Ah, {player}! You're ready for {spell} at last. Step closer and I'll show you.";
+}
+
+std::string BuildGenerateTrainerSpellBarkUserPrompt(GenBarkRequest const& req)
+{
+    std::ostringstream ss;
+    ss << "Trainer facts:\n";
+    ss << "- Name: " << req.npcName << "\n";
+    if (!req.npcSubName.empty()) ss << "- Title: " << req.npcSubName << "\n";
+    if (!req.roleStr.empty())    ss << "- Kind: " << req.roleStr << "\n";
+    if (!req.zoneName.empty())   ss << "- Zone: " << req.zoneName << "\n";
+    if (!req.extraInstruction.empty())
+        ss << "\n" << req.extraInstruction << "\n";
+    ss << "\nWrite the single reusable line now. Put {spell} where the ability name goes; do not name a real spell.";
+    return ss.str();
+}
+
+void GenerateTrainerSpellBarkCacheWorker(GenBarkRequest req)
+{
+    NpcChat_ApiConfig cfg = BuildGenerationApiConfig(220);
+    NpcChat_LLMResult res = NpcChat_CallLLM(
+        cfg,
+        BuildGenerateTrainerSpellBarkSystemPrompt(),
+        BuildGenerateTrainerSpellBarkUserPrompt(req));
+
+    std::string const fallback = "Ah, {player}! You look ready to learn {spell}. Step closer and I will teach you.";
+    std::string generated;
+
+    if (res.success && !TrimCopy(res.text).empty())
+    {
+        generated = TrimCopy(res.text);
+        if (generated.rfind("```", 0) == 0)
+        {
+            size_t firstNl = generated.find('\n');
+            size_t lastFence = generated.rfind("```");
+            if (firstNl != std::string::npos && lastFence != std::string::npos && lastFence > firstNl)
+                generated = TrimCopy(generated.substr(firstNl + 1, lastFence - firstNl - 1));
+        }
+
+        std::istringstream in(generated);
+        std::string line, first;
+        while (std::getline(in, line))
+        {
+            line = TrimCopy(line);
+            if (!line.empty()) { first = line; break; }
+        }
+        generated = StripWrappingQuotes(first.empty() ? generated : first);
+    }
+
+    // The {spell} placeholder is mandatory: without it the speak-time substitution has nowhere to put
+    // the ability name. Fall back to a safe template if the model omitted it or returned junk.
+    if (generated.empty() || IsBadGeneratedBarkValue(generated) || generated.find("{spell}") == std::string::npos)
+        generated = fallback;
+
+    if (!SaveNpcBarkCache(req, "trainer_spell", generated))
+        QueueSystemMessage(req.playerGuidRaw, "NPC Chat trainer-spell bark generation finished but failed to save the DB cache row.");
+    else
+        QueueSystemMessage(req.playerGuidRaw, "NPC Chat trainer-spell bark saved for " + req.npcName + " entry " + std::to_string(req.npcEntry) + ".");
 }
 
 void GenerateHostileBarksWorker(GenBarkRequest req)
@@ -4707,7 +5015,10 @@ private:
             if (g_TrainerBarksEnabled && ShouldRunTimer(timers.trainerMs, diff, g_TrainerBarksScanIntervalMs))
             {
                 std::string reason;
-                bool ok = SpeakCachedTrainerBark(player, selectedNpc, false, &reason);
+                // Prefer the spell-aware "you're ready to learn X" bark; fall back to the generic one.
+                bool ok = SpeakCachedTrainerSpellBark(player, selectedNpc, false, &reason);
+                if (!ok)
+                    ok = SpeakCachedTrainerBark(player, selectedNpc, false, &reason);
                 if (!ok)
                     BarkDebug(player, "trainer bark skipped for " + std::string(selectedNpc->GetName()) + ": " + reason);
             }
@@ -4910,6 +5221,8 @@ private:
         req.gender = GenderStr(npc->getGender());
         req.creatureType = CreatureTypeStr(npc->GetCreatureType());
         req.autoTags = ResolveCreatureAutoTags(npc);
+        if (IsTrainerNpc(npc))
+            req.trainerInfo = BuildTrainerCurriculumText(npc, player, true);
 
         if (CreatureTemplate const* tmpl = npc->GetCreatureTemplate())
         {
@@ -5184,6 +5497,9 @@ private:
             handler->PSendSysMessage(".npcc gen bark quest [questId] [quoted extra direction] - same as gen quest");
             handler->PSendSysMessage(".npcc gen bark relationship [quoted extra direction]");
             handler->PSendSysMessage(".npcc gen bark hostile [quoted extra direction]");
+            handler->PSendSysMessage(".npcc trainer - list spells the selected trainer can teach you now");
+            handler->PSendSysMessage("GM/Allowed: .npcc gen bark trainerspell - 'ready to learn X' bark (uses {{spell}})");
+            handler->PSendSysMessage(".npcc bark trainerspell - test the trainer-spell bark");
             handler->PSendSysMessage(".npcc bark quest [questId]");
             handler->PSendSysMessage(".npcc bark questender [questId]");
             handler->PSendSysMessage(".npcc bark relationship");
@@ -5462,6 +5778,8 @@ private:
             std::string barkMode = "relationship";
             if (StartsWithWord(rest, "hostile", barkRest) || StartsWithWord(rest, "enemy", barkRest))
                 barkMode = "hostile";
+            else if (StartsWithWord(rest, "trainerspell", barkRest) || StartsWithWord(rest, "spell", barkRest))
+                barkMode = "trainerspell";
             else if (StartsWithWord(rest, "trainer", barkRest) || StartsWithWord(rest, "train", barkRest))
                 barkMode = "trainer";
             else if (StartsWithWord(rest, "questender", barkRest) || StartsWithWord(rest, "ender", barkRest))
@@ -5472,7 +5790,7 @@ private:
                 barkMode = "relationship";
             else
             {
-                handler->PSendSysMessage("Usage: .npcc bark <relationship|hostile|trainer|quest|questender> [questId]");
+                handler->PSendSysMessage("Usage: .npcc bark <relationship|hostile|trainer|trainerspell|quest|questender> [questId]");
                 return true;
             }
             std::string reason;
@@ -5482,6 +5800,13 @@ private:
                     handler->PSendSysMessage("NPC Chat cached hostile bark fired.");
                 else
                     handler->PSendSysMessage("NPC Chat hostile bark did not fire: {}", reason.c_str());
+            }
+            else if (barkMode == "trainerspell")
+            {
+                if (SpeakCachedTrainerSpellBark(player, npc, true, &reason))
+                    handler->PSendSysMessage("NPC Chat cached trainer-spell bark fired.");
+                else
+                    handler->PSendSysMessage("NPC Chat trainer-spell bark did not fire: {}", reason.c_str());
             }
             else if (barkMode == "trainer")
             {
@@ -5621,6 +5946,46 @@ private:
             return true;
         }
 
+        if (StartsWithWord(arg, "trainer", rest))
+        {
+            Player* player = GetCommandPlayer(handler);
+            if (!player)
+            {
+                handler->PSendSysMessage("This command must be used in game.");
+                return true;
+            }
+            Creature* npc = GetSelectedCreature(handler);
+            if (!npc)
+            {
+                handler->PSendSysMessage("Target a trainer first.");
+                return true;
+            }
+            if (!sObjectMgr->GetTrainer(npc->GetEntry()))
+            {
+                handler->PSendSysMessage("{} (entry {}) has no trainer spell list.", npc->GetName(), npc->GetEntry());
+                return true;
+            }
+
+            std::vector<LearnableSpell> learnable = GetLearnableTrainerSpells(player, npc);
+            handler->PSendSysMessage("Trainer {} ({}): {} ability/abilities learnable by you right now.",
+                npc->GetName(), TrainerTypeName(npc).c_str(), static_cast<uint32>(learnable.size()));
+            int shown = 0;
+            for (LearnableSpell const& s : learnable)
+            {
+                handler->PSendSysMessage("  {} - {} (reqLevel {})", s.spellId, s.name.c_str(), s.reqLevel);
+                if (++shown >= 15)
+                {
+                    handler->PSendSysMessage("  ...and more.");
+                    break;
+                }
+            }
+            if (learnable.empty())
+                handler->PSendSysMessage("Nothing new for you here right now (level/skill not met, or already known).");
+            else
+                handler->PSendSysMessage("Pre-generate the bark with: .npcc gen bark trainerspell");
+            return true;
+        }
+
         if (StartsWithWord(arg, "quest", rest) || StartsWithWord(arg, "quests", rest))
         {
             Player* player = GetCommandPlayer(handler);
@@ -5756,6 +6121,11 @@ private:
                     barkMode = "hostile";
                     extraBark = barkRest;
                 }
+                else if (StartsWithWord(genKindRest, "trainerspell", barkRest) || StartsWithWord(genKindRest, "spell", barkRest))
+                {
+                    barkMode = "trainerspell";
+                    extraBark = barkRest;
+                }
                 else if (StartsWithWord(genKindRest, "trainer", barkRest) || StartsWithWord(genKindRest, "train", barkRest))
                 {
                     barkMode = "trainer";
@@ -5835,6 +6205,30 @@ private:
                     std::thread([barkReq = std::move(barkReq)]() mutable { ::GenerateHostileBarkCacheWorker(std::move(barkReq)); }).detach();
                     handler->PSendSysMessage("NPC Chat hostile SQL bark generation started for {}.", npc->GetName());
                     handler->PSendSysMessage("You will get a system message when the DB cache row is saved.");
+                }
+                else if (barkMode == "trainerspell")
+                {
+                    if (!CanManageSharedSubPrompts(handler))
+                    {
+                        handler->PSendSysMessage("Only GMs or configured NPC Chat creator accounts may generate shared trainer-spell barks.");
+                        return true;
+                    }
+                    if (!IsTrainerNpc(npc) || !sObjectMgr->GetTrainer(npc->GetEntry()))
+                    {
+                        handler->PSendSysMessage("Target NPC is not a trainer with a spell list.");
+                        return true;
+                    }
+                    barkReq.roleStr = TrainerTypeName(npc);
+                    std::string curriculum = BuildTrainerCurriculumText(npc, nullptr, false);
+                    if (!curriculum.empty())
+                    {
+                        std::string s = "Abilities this trainer teaches, by level (flavor/grounding only - do NOT name a specific one in the line; always use {spell}):\n" + curriculum;
+                        barkReq.extraInstruction = barkReq.extraInstruction.empty() ? s : (barkReq.extraInstruction + "\n" + s);
+                    }
+                    barkReq.cacheContext = "trainer_spell";
+                    std::thread([barkReq = std::move(barkReq)]() mutable { ::GenerateTrainerSpellBarkCacheWorker(std::move(barkReq)); }).detach();
+                    handler->PSendSysMessage("NPC Chat trainer-spell bark generation started for {}.", npc->GetName());
+                    handler->PSendSysMessage("Saves one universal DB row using a {{spell}} placeholder, filled per learnable spell at speak time.");
                 }
                 else if (barkMode == "trainer")
                 {
@@ -5930,6 +6324,8 @@ private:
 
             req.mode = mode;
             req.extraInstruction = extra;
+            if (IsTrainerNpc(npc))
+                req.trainerInfo = BuildTrainerCurriculumText(npc, nullptr, false);
             if (mode == "personal")
                 req.outputPath = PersonalPromptFilePath(player->GetName(), player->GetGUID().GetRawValue(), npc->GetName(), npc->GetEntry());
             else
