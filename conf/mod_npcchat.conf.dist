@@ -1,4 +1,4 @@
-###################################################################################################
+w###################################################################################################
 # NPC Chat LLM - current combined feature config
 # Safe defaults: all proximity/automatic bark systems are OFF.
 # Manual .npcc commands still work when NpcChat.Enable = 1.
@@ -191,21 +191,112 @@ NpcChat.HostileFirstTalk.ElitesOnly = 1
 
 # Scan quoted .npcc gen direction plus copied NPC facts, then auto-attach
 # matching .prompt files from NpcChat.HistoryPath/subprompts.
-NpcChat.GenAutoSubPrompts = 1
+# DEPRECATED: not read by the current build (auto-subprompt generation was replaced by
+# NpcChat.SubPrompt.ImportOnStartup + NpcChat.SubPromptCreatorAccounts). Left here commented.
+# NpcChat.GenAutoSubPrompts = 1
 
 # Total auto-matched files allowed per generation.
-NpcChat.GenAutoSubPromptMaxTotal = 6
+# NpcChat.GenAutoSubPromptMaxTotal = 6
 
 # Prevent one type/category from flooding the context.
-NpcChat.GenAutoSubPromptMaxPerCategory = 2
+# NpcChat.GenAutoSubPromptMaxPerCategory = 2
 
 # Send a system message showing which auto-subprompts fired.
-NpcChat.GenAutoSubPromptDebug = 1
+# NpcChat.GenAutoSubPromptDebug = 1
 
 # Treat *.npc.prompt and *.relationship.prompt files as relationship/world context,
 # not as identity replacement.
-NpcChat.GenAutoRelationshipPrompts = 1
+# NpcChat.GenAutoRelationshipPrompts = 1
 
 NpcChat.UntargetedChat.Enable = 1
 NpcChat.UntargetedChat.YellRange = 50
 NpcChat.UntargetedChat.HostileYell = 1
+
+
+###################################################################################################
+# MAINTENANCE ADDITIONS - keys the current build reads that were missing from this file
+###################################################################################################
+
+# Verify TLS certificate on HTTPS API calls. Set 0 only for a self-signed local proxy. Default: 1
+NpcChat.Api.VerifyCert = 1
+
+# Max simultaneous in-flight LLM requests across all worker threads (cost/socket guard). Default: 4
+NpcChat.Api.MaxConcurrentRequests = 4
+
+# Send a system message when a proximity bark is skipped or fired, for tuning. Default: 0
+NpcChat.BarkDebug = 0
+
+# Minimum seconds between bark-debug messages so they don't spam. Default: 15
+NpcChat.BarkDebugCooldownSec = 15
+
+# Import sub-prompt .prompt files from disk into SQL on startup (new rows only).
+# Force a full re-sync anytime with: .npcc sub import overwrite . Default: 1
+NpcChat.SubPrompt.ImportOnStartup = 1
+
+
+###################################################################################################
+# PLAYERBOT CHAT  - talk to playerbots (only genuine bots ever reply; real players never do)
+#
+# Reuses the main NpcChat.* API/model above. Bot files live under:
+#   <NpcChat.HistoryPath>/bots/shared/    identity cards, generated on first contact
+#   <NpcChat.HistoryPath>/bots/personal/  {player}__{bot} history + personal cards
+###################################################################################################
+
+# Master switch for ALL bot-chat surfaces (whisper / party-raid / target / LFG / guild).
+# Code default is 0; set to 1 to run the feature.
+NpcChat.Bot.Enable = 1
+
+# Whisper a bot -> it whispers back. Default: 1
+NpcChat.Bot.ReplyWhisper = 1
+
+# Name a bot (or several) in party/raid -> each named bot replies in that channel. Default: 1
+NpcChat.Bot.ReplyPartyRaid = 1
+
+# Target a bot and /say within range -> it answers with a chat bubble. Default: 1
+NpcChat.Bot.ReplyTarget = 1
+
+# Max yards for the target-and-say surface. Default: 25
+NpcChat.Bot.TriggerRange = 25.0
+
+# Recent lines of (player+bot) history fed back to the model. Main cost dial. Default: 20
+NpcChat.Bot.HistoryMaxLines = 20
+
+# On first contact, generate a one-time shared identity card via the LLM.
+# 0 = use a plain template instead (no generation cost). Default: 1
+NpcChat.Bot.GenerateSharedCard = 1
+
+
+###################################################################################################
+# PLAYERBOT LFG  -  "LFM heals" in General finds a matching nearby bot who answers (via whisper)
+###################################################################################################
+
+# Master switch for LFG matchmaking. Default: 1
+NpcChat.Bot.Lfg.Enable = 1
+
+# Only match bots within this many levels of the requester (dungeon-bracket sanity). Default: 8
+NpcChat.Bot.Lfg.LevelBracket = 8
+
+# Run LFG matching on the General channel. Default: 1
+NpcChat.Bot.Lfg.General = 1
+
+# Run LFG matching on the Trade channel (global and spammier). Default: 0
+NpcChat.Bot.Lfg.Trade = 0
+
+# Ambient (non-LFG) General chatter: percent chance ONE local bot chimes in on a normal
+# message. 0 = off. This is the spammy/costly one - raise slowly after testing. Default: 0
+NpcChat.Bot.General.Chance = 0
+
+
+###################################################################################################
+# PLAYERBOT GUILD CHAT  -  player-provoked only, never initiates, turn-capped (token guard)
+###################################################################################################
+
+# Master switch for guild-chat replies. Default: 1
+NpcChat.Bot.Guild.Enable = 1
+
+# Max replies a bot gives per conversation window before it goes quiet. Default: 4
+NpcChat.Bot.Guild.MaxTurns = 4
+
+# Idle seconds that closes a conversation window; afterward a fresh provocation may
+# start a new one. Default: 300
+NpcChat.Bot.Guild.WindowSec = 300

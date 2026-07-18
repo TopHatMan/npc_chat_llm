@@ -37,6 +37,12 @@
 #include "Chat.h"            // CommandScript / ChatHandler
 
 #include "npcchat_llm.h"
+#include "Playerbots.h"     // PlayerbotAI, RandomPlayerbotMgr, GET_PLAYERBOT_AI
+#include "AiFactory.h"      // GetPlayerSpecTab
+#include "ChatHelper.h"     // FormatClass (readable spec)
+#include "Guild.h"          // BroadcastToGuild
+#include "Channel.h"        // Channel::Say / IsOn
+#include <set>
 
 #include <algorithm>
 #include <atomic>
@@ -4822,6 +4828,836 @@ namespace
         std::lock_guard<std::mutex> lock(g_ReplyMutex);
         g_ReplyQueue.push(std::move(reply));
     }
+
+    // =======================================================================
+    // BOT CHAT  (whisper / party-raid / target a playerbot)
+    // Only genuine bots reply; gate is WorldSession::IsBot(), fails closed.
+    // =======================================================================
+// --- gate ------------------------------------------------------------------
+    inline bool IsGenuineBot(Player* p)
+    {
+        return p && p->GetSession() && p->GetSession()->IsBot();
+    }
+    inline bool IsRealPlayerSession(Player* p)
+    {
+        return p && p->GetSession() && !p->GetSession()->IsBot();
+    }
+
+    // --- lazy config (NpcChat.Bot.*) -------------------------------------------
+    struct BotCfg
+    {
+        bool  enable = false;
+        bool  replyWhisper = true;
+        bool  replyPartyRaid = true;
+        bool  replyTarget = true;
+        float triggerRange = 25.0f;
+        int   historyTail = 20;
+        bool  generateSharedCard = true;
+    };
+
+    inline BotCfg const& GetBotCfg()
+    {
+        static BotCfg cfg;
+        static std::once_flag once;
+        std::call_once(once, []
+            {
+                cfg.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Enable", false);
+                cfg.replyWhisper = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyWhisper", true);
+                cfg.replyPartyRaid = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyPartyRaid", true);
+                cfg.replyTarget = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyTarget", true);
+                cfg.triggerRange = sConfigMgr->GetOption<float>("NpcChat.Bot.TriggerRange", 25.0f);
+                cfg.historyTail = sConfigMgr->GetOption<int32>("NpcChat.Bot.HistoryMaxLines", 20);
+                cfg.generateSharedCard = sConfigMgr->GetOption<bool>("NpcChat.Bot.GenerateSharedCard", true);
+            });
+        return cfg;
+    }
+
+    // --- race / class / gender text --------------------------------------------
+    inline const char* BotGenderName(uint8 g)
+    {
+    switch (g) { case 0: return "male"; case 1: return "female"; default: return ""; }
+    }
+    inline const char* BotRaceName(uint8 r)
+    {
+        switch (r)
+        {
+        case 1:  return "Human";      case 2:  return "Orc";        case 3:  return "Dwarf";
+        case 4:  return "Night Elf";  case 5:  return "Undead";     case 6:  return "Tauren";
+        case 7:  return "Gnome";      case 8:  return "Troll";      case 10: return "Blood Elf";
+        case 11: return "Draenei";    default: return "";
+        }
+    }
+    inline const char* BotClassName(uint8 c)
+    {
+        switch (c)
+        {
+        case 1:  return "Warrior";  case 2:  return "Paladin";      case 3:  return "Hunter";
+        case 4:  return "Rogue";    case 5:  return "Priest";       case 6:  return "Death Knight";
+        case 7:  return "Shaman";   case 8:  return "Mage";         case 9:  return "Warlock";
+        case 11: return "Druid";    default: return "";
+        }
+    }
+
+    // --- bot file paths (mirror your NPC shared/personal layout) ---------------
+    inline std::string BotBase(std::string const& botName, uint64_t botGuidRaw)
+    {
+        return SanitizeName(botName) + "_" + std::to_string(botGuidRaw);
+    }
+    inline std::string BotSharedCardFilePath(std::string const& botName, uint64_t botGuidRaw)
+    {
+        return g_HistoryPath + "/bots/shared/" + BotBase(botName, botGuidRaw) + ".card";
+    }
+    inline std::string BotPersonalCardFilePath(std::string const& playerName, uint64_t playerGuidRaw,
+        std::string const& botName, uint64_t botGuidRaw)
+    {
+        return g_HistoryPath + "/bots/personal/" + PlayerHistoryBase(playerName, playerGuidRaw) +
+            "/" + BotBase(botName, botGuidRaw) + ".card";
+    }
+    inline std::string BotPersonalHistoryFilePath(std::string const& playerName, uint64_t playerGuidRaw,
+        std::string const& botName, uint64_t botGuidRaw)
+    {
+        return g_HistoryPath + "/bots/personal/" + PlayerHistoryBase(playerName, playerGuidRaw) +
+            "/" + BotBase(botName, botGuidRaw) + ".history";
+    }
+    inline void EnsureBotChatDirectories()
+    {
+        try
+        {
+            std::filesystem::create_directories(g_HistoryPath + "/bots/shared");
+            std::filesystem::create_directories(g_HistoryPath + "/bots/personal");
+        }
+        catch (std::exception const&) {}
+    }
+
+    // --- cross-thread structs / queue ------------------------------------------
+    enum class BotChannel { Whisper, Say, Party, Raid };
+
+    struct BotChatRequest
+    {
+        uint64_t    playerGuidRaw = 0;
+        std::string playerName;
+        uint64_t    botGuidRaw = 0;
+        std::string botName;
+        uint32_t    botLevel = 0;
+        std::string botGender;
+        std::string botRace;
+        std::string botClass;
+        BotChannel  channel = BotChannel::Whisper;
+        std::string message;
+    };
+
+    struct BotChatReply
+    {
+        uint64_t    playerGuidRaw = 0;
+        uint64_t    botGuidRaw = 0;
+        BotChannel  channel = BotChannel::Whisper;
+        std::string text;
+    };
+
+    inline std::queue<BotChatReply>& BotReplyQueue() { static std::queue<BotChatReply> q; return q; }
+    inline std::mutex& BotReplyMutex() { static std::mutex m; return m; }
+
+    // --- persona + prompts ------------------------------------------------------
+    inline std::string BuildBotPersona(BotChatRequest const& req)
+    {
+        std::ostringstream ss;
+        ss << "a level " << req.botLevel;
+        if (!req.botGender.empty()) ss << " " << req.botGender;
+        if (!req.botRace.empty())   ss << " " << req.botRace;
+        if (!req.botClass.empty())  ss << " " << req.botClass;
+        return ss.str();
+    }
+
+    // One-time shared identity card, generated from the bot's real character.
+    inline std::string GenerateBotSharedCard(BotChatRequest const& req)
+    {
+        std::string sys = "You write short third-person character descriptions for a "
+            "World of Warcraft roleplay server. Output only the description, no dialogue.";
+        std::ostringstream usr;
+        usr << "Write a 3 to 5 sentence description of " << req.botName << ", "
+            << BuildBotPersona(req) << ". Cover personality, background, and how they "
+            << "speak. Do not mention game mechanics, players, or that they are a bot.";
+
+        NpcChat_ApiConfig cfg = BuildGenerationApiConfig();
+        NpcChat_LLMResult res = NpcChat_CallLLM(cfg, sys, usr.str());
+        if (res.success && !res.text.empty())
+            return res.text;
+
+        // Fallback so the bot still has an identity if generation fails.
+        return req.botName + " is " + BuildBotPersona(req) + ", a seasoned adventurer of Azeroth.";
+    }
+
+    inline std::string BuildBotSystemPrompt(BotChatRequest const& req,
+        std::string const& sharedCard, std::string const& personalCard)
+    {
+        std::ostringstream ss;
+        ss << "You are " << req.botName << ", " << BuildBotPersona(req)
+            << ", adventuring in Azeroth (World of Warcraft) as a companion to fellow players.\n";
+        if (!sharedCard.empty())
+            ss << "Who you are: " << sharedCard << "\n";
+        if (!personalCard.empty())
+            ss << "Your history with " << req.playerName << ": " << personalCard << "\n";
+        ss << "Stay fully in character. Use only your own spoken words: no narration, no "
+            "asterisks, no out-of-character text, no game mechanics. Keep replies to one or "
+            "two short sentences suitable for a single line of in-game chat.";
+        return ss.str();
+    }
+
+    inline std::string BuildBotUserPrompt(BotChatRequest const& req, std::deque<std::string> const& history)
+    {
+        std::ostringstream ss;
+        if (!history.empty())
+        {
+            ss << "Recent conversation:\n";
+            for (auto const& l : history) ss << l << "\n";
+            ss << "\n";
+        }
+        ss << req.playerName << " says to you: \"" << req.message << "\"\n\n"
+            << "Reply as " << req.botName << ":";
+        return ss.str();
+    }
+
+    // --- worker ----------------------------------------------------------------
+    inline void BotWorkerRun(BotChatRequest req)
+    {
+        std::string const sharedCardPath = BotSharedCardFilePath(req.botName, req.botGuidRaw);
+        std::string const personalCardPath = BotPersonalCardFilePath(req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
+        std::string const historyPath = BotPersonalHistoryFilePath(req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
+
+        BotCfg const& cfg = GetBotCfg();
+
+        std::deque<std::string> history;
+        std::string sharedCard, personalCard;
+
+        {
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            EnsureBotChatDirectories();
+            sharedCard = ReadWholeTextFile(sharedCardPath);
+            personalCard = ReadWholeTextFile(personalCardPath);
+            history = LoadHistoryTail(historyPath, cfg.historyTail);
+            AppendHistoryLine(historyPath, req.playerName + ": " + req.message);
+        }
+
+        // First contact: generate the shared identity card (LLM, once), stub the personal card.
+        if (sharedCard.empty() && cfg.generateSharedCard)
+        {
+            sharedCard = GenerateBotSharedCard(req);   // outside the mutex -- do not block file IO
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            WriteWholeTextFile(sharedCardPath, sharedCard, false); // false = keep existing if another worker won the race
+        }
+        if (personalCard.empty())
+        {
+            personalCard = req.botName + " and " + req.playerName + " have recently begun talking.";
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            WriteWholeTextFile(personalCardPath, personalCard, false);
+        }
+
+        NpcChat_ApiConfig apiCfg = BuildChatApiConfig();
+        NpcChat_LLMResult res = NpcChat_CallLLM(apiCfg,
+            BuildBotSystemPrompt(req, sharedCard, personalCard),
+            BuildBotUserPrompt(req, history));
+
+        if (!res.success || res.text.empty())
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            AppendHistoryLine(historyPath, req.botName + ": " + res.text);
+        }
+
+        BotChatReply reply;
+        reply.playerGuidRaw = req.playerGuidRaw;
+        reply.botGuidRaw = req.botGuidRaw;
+        reply.channel = req.channel;
+        reply.text = res.text;
+
+        std::lock_guard<std::mutex> lock(BotReplyMutex());
+        BotReplyQueue().push(std::move(reply));
+    }
+
+    // Capture bot/player data on the MAIN THREAD, then hand the worker only copies.
+    inline void DispatchBot(Player* realPlayer, Player* bot, BotChannel channel, std::string const& message)
+    {
+        BotChatRequest req;
+        req.playerGuidRaw = realPlayer->GetGUID().GetRawValue();
+        req.playerName = realPlayer->GetName();
+        req.botGuidRaw = bot->GetGUID().GetRawValue();
+        req.botName = bot->GetName();
+        req.botLevel = bot->GetLevel();
+        req.botGender = BotGenderName(bot->getGender());
+        req.botRace = BotRaceName(bot->getRace());
+        req.botClass = BotClassName(bot->getClass());
+        req.channel = channel;
+        req.message = message;
+        std::thread(BotWorkerRun, std::move(req)).detach();
+    }
+
+    // --- surface entrypoints (called from the PlayerScript hooks) ---------------
+
+    // Whisper a bot -> it whispers back. `text` is the already-trimmed message.
+    inline bool HandleBotWhisper(Player* player, uint32 type, Player* receiver, std::string const& text)
+    {
+        BotCfg const& cfg = GetBotCfg();
+        if (!cfg.enable || !cfg.replyWhisper) return false;
+        if (type != CHAT_MSG_WHISPER) return false;
+        if (!IsRealPlayerSession(player)) return false;   // only real senders
+        if (!IsGenuineBot(receiver)) return false;         // only bot receivers
+        if (text.empty() || text[0] == '.') return false;
+        DispatchBot(player, receiver, BotChannel::Whisper, text);
+        return true;
+    }
+
+    // Name bot(s) in party/raid -> each named genuine bot in the group replies.
+    inline void HandleBotGroup(Player* player, uint32 type, Group* group, std::string const& text)
+    {
+        BotCfg const& cfg = GetBotCfg();
+        if (!cfg.enable || !cfg.replyPartyRaid || !group) return;
+        if (!IsRealPlayerSession(player)) return;
+        if (text.empty() || text[0] == '.') return;
+
+        BotChannel channel;
+        switch (type)
+        {
+        case CHAT_MSG_PARTY: case CHAT_MSG_PARTY_LEADER:
+            channel = BotChannel::Party; break;
+        case CHAT_MSG_RAID:  case CHAT_MSG_RAID_LEADER: case CHAT_MSG_RAID_WARNING:
+            channel = BotChannel::Raid;  break;
+        default: return;
+        }
+
+        std::string lowered = ToLowerCopy(text);
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next()) // [AC-API]
+        {
+            Player* member = itr->GetSource();
+            if (!member || member == player || !IsGenuineBot(member)) continue;
+            if (lowered.find(ToLowerCopy(member->GetName())) == std::string::npos) continue;
+            DispatchBot(player, member, channel, text);
+        }
+    }
+
+    // Target a bot and /say -> it answers. `text` is the already-trimmed message.
+    inline bool HandleBotSay(Player* player, Player* bot, std::string const& text)
+    {
+        BotCfg const& cfg = GetBotCfg();
+        if (!cfg.enable || !cfg.replyTarget) return false;
+        if (!IsRealPlayerSession(player) || !IsGenuineBot(bot)) return false;
+        if (!bot->IsAlive() || !player->IsWithinDist(bot, cfg.triggerRange, true)) return false;
+        if (text.empty() || text[0] == '.') return false;
+        DispatchBot(player, bot, BotChannel::Say, text);
+        return true;
+    }
+
+    // --- emit (called from WorldScript::OnUpdate on the MAIN THREAD) ------------
+    inline void EmitBotReplies()
+    {
+        std::queue<BotChatReply> local;
+        {
+            std::lock_guard<std::mutex> lock(BotReplyMutex());
+            if (BotReplyQueue().empty()) return;
+            std::swap(local, BotReplyQueue());
+        }
+
+        while (!local.empty())
+        {
+            BotChatReply& r = local.front();
+
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(r.botGuidRaw));
+            Player* player = ObjectAccessor::FindPlayer(ObjectGuid(r.playerGuidRaw));
+
+            if (bot && bot->IsInWorld())
+            {
+                switch (r.channel)
+                {
+                case BotChannel::Whisper:
+                    if (player) bot->Whisper(r.text, LANG_UNIVERSAL, player); // [AC-API]
+                    break;
+                case BotChannel::Say:
+                    bot->Say(r.text, LANG_UNIVERSAL);                          // [AC-API]
+                    break;
+                case BotChannel::Party:
+                case BotChannel::Raid:
+                    if (Group* g = bot->GetGroup())
+                    {
+                        ChatMsg cm = (r.channel == BotChannel::Raid) ? CHAT_MSG_RAID : CHAT_MSG_PARTY;
+                        WorldPacket data;
+                        // [AC-API] BuildChatPacket / BroadcastPacket signatures vary by core.
+                        // Fallback: loop g members and SendDirectMessage per receiver.
+                        ChatHandler::BuildChatPacket(data, cm, LANG_UNIVERSAL, bot, bot, r.text);
+                        g->BroadcastPacket(&data, false);
+                    }
+                    break;
+                }
+            }
+            local.pop();
+        }
+    }
+
+    // =======================================================================
+    // BOT ROSTER + LFG MATCHER + GUILD/CHANNEL SURFACES
+    // =======================================================================
+    enum class BotRole : uint8 { None, Tank, Heal, Dps };
+
+    struct BotRosterEntry
+    {
+        uint64_t    guidRaw = 0;
+        std::string name;
+        uint8       level = 0;
+        uint8       cls = 0;      // Classes enum (CLASS_*)
+        uint8       race = 0;
+        BotRole     role = BotRole::None;
+        std::string specName;       // "Holy Priest"
+        bool        isRandom = false; // true = PLAYER BOT (rndbot); false = ALT PLAYER BOT
+        bool        knownToPlayer = false; // has prior personal history with the requester
+    };
+
+    // --- WoW shorthand ---------------------------------------------------------
+    inline const char* ClassShort(uint8 c)
+    {
+        switch (c)
+        {
+        case CLASS_WARRIOR: return "WAR";   case CLASS_PALADIN: return "PAL";
+        case CLASS_HUNTER:  return "HUNT";  case CLASS_ROGUE:   return "ROG";
+        case CLASS_PRIEST:  return "PRIEST"; case CLASS_DEATH_KNIGHT: return "DK";
+        case CLASS_SHAMAN:  return "SHM";   case CLASS_MAGE:    return "MAGE";
+        case CLASS_WARLOCK: return "LOCK";  case CLASS_DRUID:   return "DRUID";
+        default: return "";
+        }
+    }
+    inline const char* RoleShort(BotRole r)
+    {
+        switch (r) {
+        case BotRole::Tank: return "TANK"; case BotRole::Heal: return "HEALS";
+        case BotRole::Dps: return "DPS"; default: return "";
+        }
+    }
+
+    // spec tab + class -> role. Mirrors LfgJoinAction::GetRoles() from mod-playerbots.
+    inline BotRole ResolveBotRole(Player* bot)
+    {
+        uint8 spec = AiFactory::GetPlayerSpecTab(bot);   // dominant talent tree 0/1/2
+        switch (bot->getClass())
+        {
+        case CLASS_WARRIOR: return spec == 2 ? BotRole::Tank : BotRole::Dps;
+        case CLASS_PALADIN: return spec == 1 ? BotRole::Tank : (spec == 0 ? BotRole::Heal : BotRole::Dps);
+        case CLASS_PRIEST:  return spec != 2 ? BotRole::Heal : BotRole::Dps;
+        case CLASS_SHAMAN:  return spec == 2 ? BotRole::Heal : BotRole::Dps;
+        case CLASS_DRUID:
+            if (spec == 2) return BotRole::Heal;
+            if (spec == 1 && bot->HasAura(16931)) return BotRole::Tank; // thick hide = bear tank
+            return BotRole::Dps;
+        case CLASS_DEATH_KNIGHT: return spec == 0 ? BotRole::Tank : BotRole::Dps; // blood approx
+        default: return BotRole::Dps; // hunter / rogue / mage / warlock
+        }
+    }
+
+    // --- Zone roster (MAIN THREAD only -- touches live Player objects) ----------
+    inline std::vector<BotRosterEntry> BuildZoneBotRoster(Player* me)
+    {
+        std::vector<BotRosterEntry> roster;
+        if (!me || !me->IsInWorld() || !me->GetMap())
+            return roster;
+
+        uint32 const zone = me->GetZoneId();
+        std::string const meName = me->GetName();
+        uint64_t const meGuid = me->GetGUID().GetRawValue();
+
+        Map::PlayerList const& players = me->GetMap()->GetPlayers();
+        for (Map::PlayerList::const_iterator it = players.begin(); it != players.end(); ++it)
+        {
+            Player* p = it->GetSource();  // [AC-API]
+            if (!p || !p->IsInWorld() || p == me) continue;
+            if (!IsGenuineBot(p)) continue;                 // reuse existing gate
+            if (p->GetZoneId() != zone) continue;
+
+            BotRosterEntry e;
+            e.guidRaw = p->GetGUID().GetRawValue();
+            e.name = p->GetName();
+            e.level = p->GetLevel();
+            e.cls = p->getClass();
+            e.race = p->getRace();
+            e.role = ResolveBotRole(p);
+            e.specName = ChatHelper::FormatClass(p, AiFactory::GetPlayerSpecTab(p)); // [PB-API]
+            e.isRandom = RandomPlayerbotMgr::instance().IsRandomBot(p);              // [PB-API]
+
+            // "known" bias: does the requester already have a personal history with this bot?
+            std::string hist = BotPersonalHistoryFilePath(meName, meGuid, e.name, e.guidRaw);
+            try { e.knownToPlayer = std::filesystem::exists(hist); }
+            catch (...) { e.knownToPlayer = false; }
+
+            roster.push_back(std::move(e));
+        }
+        return roster;
+    }
+
+    // --- LFG intent (parse the player's request into what they're after) --------
+    struct LfgIntent
+    {
+        bool    isLfg = false;
+        BotRole wantedRole = BotRole::None;
+        uint8   wantedClass = 0;   // 0 = any
+    };
+
+    // whole-word contains (so "war" doesn't fire on "toward")
+    inline bool ContainsWord(std::string const& hayLower, std::string const& wLower)
+    {
+        size_t pos = 0;
+        while ((pos = hayLower.find(wLower, pos)) != std::string::npos)
+        {
+            bool leftOk = (pos == 0) || !std::isalnum((unsigned char)hayLower[pos - 1]);
+            size_t end = pos + wLower.size();
+            bool rightOk = (end >= hayLower.size()) || !std::isalnum((unsigned char)hayLower[end]);
+            if (leftOk && rightOk) return true;
+            pos = end;
+        }
+        return false;
+    }
+
+    inline LfgIntent ParseLfgIntent(std::string const& msg)
+    {
+        std::string m = ToLowerCopy(msg);
+        LfgIntent in;
+        auto sub = [&](const char* w) { return m.find(w) != std::string::npos; };
+        auto word = [&](const char* w) { return ContainsWord(m, w); };
+
+        if (sub("lfg") || sub("lfm") || sub("looking for") || word("lf") || sub("need a") ||
+            sub("need healer") || sub("need tank") || sub("need dps") || sub("wtb group"))
+            in.isLfg = true;
+
+        // roles
+        if (sub("heal"))                      in.wantedRole = BotRole::Heal; // heals/healer/healz
+        else if (word("tank") || word("mt") || word("ot")) in.wantedRole = BotRole::Tank;
+        else if (word("dps") || word("deeps")) in.wantedRole = BotRole::Dps;
+
+        // classes (shorthand + full)
+        if (word("priest"))                  in.wantedClass = CLASS_PRIEST;
+        else if (word("lock") || word("warlock")) in.wantedClass = CLASS_WARLOCK;
+        else if (word("shm") || word("sham") || word("shaman")) in.wantedClass = CLASS_SHAMAN;
+        else if (word("war") || word("warr") || word("warrior")) in.wantedClass = CLASS_WARRIOR;
+        else if (word("pal") || word("pally") || word("paladin")) in.wantedClass = CLASS_PALADIN;
+        else if (word("dk") || word("deathknight")) in.wantedClass = CLASS_DEATH_KNIGHT;
+        else if (word("hunt") || word("hunter"))  in.wantedClass = CLASS_HUNTER;
+        else if (word("rog") || word("rogue"))   in.wantedClass = CLASS_ROGUE;
+        else if (word("mage"))                    in.wantedClass = CLASS_MAGE;
+        else if (word("druid") || word("boomy") || word("resto")) in.wantedClass = CLASS_DRUID;
+
+        // a role/class word plus any group-ish word counts as an LFG line even without lfg/lfm
+        if ((in.wantedRole != BotRole::None || in.wantedClass) &&
+            (sub("group") || sub("dungeon") || sub("run") || sub("inv") || in.isLfg))
+            in.isLfg = true;
+
+        return in;
+    }
+
+    // --- Matcher: the single most appropriate bot, or nothing -------------------
+    inline BotRosterEntry const* MatchBestBot(std::vector<BotRosterEntry> const& roster,
+        LfgIntent const& in, uint8 requesterLevel,
+        int levelBracket)
+    {
+        std::vector<BotRosterEntry const*> cand;
+        for (auto const& e : roster)
+        {
+            if (in.wantedClass && e.cls != in.wantedClass) continue;
+            if (in.wantedRole != BotRole::None && e.role != in.wantedRole) continue;
+            if (std::abs(int(e.level) - int(requesterLevel)) > levelBracket) continue;
+            cand.push_back(&e);
+        }
+        if (cand.empty()) return nullptr;
+
+        std::sort(cand.begin(), cand.end(), [&](BotRosterEntry const* a, BotRosterEntry const* b)
+            {
+                if (a->knownToPlayer != b->knownToPlayer) return a->knownToPlayer;      // bots you know first
+                return std::abs(int(a->level) - int(requesterLevel)) <
+                    std::abs(int(b->level) - int(requesterLevel));                    // then closest level
+            });
+        return cand.front();
+    }
+
+    // --- Guild conversation turn-cap (token-abuse guard) -----------------------
+    // Guild chat NEVER initiates. It only replies when the player provokes a bot,
+    // and only for a few turns per window before it goes quiet.
+    struct GuildConvoState { int turns = 0; time_t windowStart = 0; };
+
+    inline std::map<std::pair<uint64_t, uint64_t>, GuildConvoState>& GuildConvos()
+    {
+        static std::map<std::pair<uint64_t, uint64_t>, GuildConvoState> m;
+        return m;
+    }
+
+    // Call ONLY on player provocation. Returns true if the bot may reply now.
+    // maxTurns: replies allowed per window. windowResetSec: idle gap that starts a fresh window.
+    inline bool GuildTurnAllowed(uint64_t playerGuid, uint64_t botGuid, int maxTurns, int windowResetSec)
+    {
+        auto key = std::make_pair(playerGuid, botGuid);
+        GuildConvoState& st = GuildConvos()[key];
+        time_t now = std::time(nullptr);
+
+        if (st.windowStart == 0 || (now - st.windowStart) > windowResetSec)
+        {
+            st.windowStart = now;   // fresh conversation window
+            st.turns = 0;
+        }
+        if (st.turns >= maxTurns)
+            return false;           // cap reached -> stay silent until the window ages out
+        st.turns++;
+        return true;
+    }
+
+    // --- config (lazy) ---------------------------------------------------------
+    struct BotSurfaceCfg
+    {
+        bool   lfgEnable = true;
+        int    levelBracket = 8;
+        bool   lfgGeneral = true;
+        bool   lfgTrade = false;
+        uint32 ambientChance = 0;    // General ambient reply chance (0 = off)
+        bool   guildEnable = true;
+        int    guildMaxTurns = 4;
+        int    guildWindowSec = 300;
+    };
+    inline BotSurfaceCfg const& GetSurfaceCfg()
+    {
+        static BotSurfaceCfg c;
+        static std::once_flag o;
+        std::call_once(o, []
+            {
+                c.lfgEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Enable", true);
+                c.levelBracket = sConfigMgr->GetOption<int32>("NpcChat.Bot.Lfg.LevelBracket", 8);
+                c.lfgGeneral = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.General", true);
+                c.lfgTrade = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Trade", false);
+                c.ambientChance = sConfigMgr->GetOption<uint32>("NpcChat.Bot.General.Chance", 0);
+                c.guildEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Guild.Enable", true);
+                c.guildMaxTurns = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.MaxTurns", 4);
+                c.guildWindowSec = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.WindowSec", 300);
+            });
+        return c;
+    }
+
+    // --- cross-thread structs / queue ------------------------------------------
+    enum class SurfaceKind { GuildMsg, ChannelMsg };
+
+    struct BotSurfaceRequest
+    {
+        uint64_t    playerGuidRaw = 0;
+        std::string playerName;
+        uint64_t    botGuidRaw = 0;
+        std::string botName;
+        uint32_t    botLevel = 0;
+        std::string botGender, botRace, botClass;
+        SurfaceKind kind = SurfaceKind::GuildMsg;
+        std::string channelName;   // for ChannelMsg emit
+        std::string contextHint;   // e.g. LFG note steering the reply
+        std::string message;
+    };
+    struct BotSurfaceReply
+    {
+        uint64_t    playerGuidRaw = 0;
+        uint64_t    botGuidRaw = 0;
+        SurfaceKind kind = SurfaceKind::GuildMsg;
+        std::string channelName;
+        std::string text;
+    };
+    inline std::queue<BotSurfaceReply>& SurfaceReplyQueue() { static std::queue<BotSurfaceReply> q; return q; }
+    inline std::mutex& SurfaceReplyMutex() { static std::mutex m; return m; }
+
+    // --- worker (isolated; reuses card/history/LLM leaf helpers) ---------------
+    inline void BotSurfaceWorkerRun(BotSurfaceRequest req)
+    {
+        std::string persona = "a level " + std::to_string(req.botLevel);
+        if (!req.botGender.empty()) persona += " " + req.botGender;
+        if (!req.botRace.empty())   persona += " " + req.botRace;
+        if (!req.botClass.empty())  persona += " " + req.botClass;
+
+        std::string const sharedCardPath = BotSharedCardFilePath(req.botName, req.botGuidRaw);
+        std::string const personalCardPath = BotPersonalCardFilePath(req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
+        std::string const historyPath = BotPersonalHistoryFilePath(req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
+
+        std::deque<std::string> history;
+        std::string sharedCard, personalCard;
+        {
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            EnsureBotChatDirectories();
+            sharedCard = ReadWholeTextFile(sharedCardPath);
+            personalCard = ReadWholeTextFile(personalCardPath);
+            history = LoadHistoryTail(historyPath, 20);
+            AppendHistoryLine(historyPath, req.playerName + ": " + req.message);
+        }
+
+        std::ostringstream sys;
+        sys << "You are " << req.botName << ", " << persona
+            << ", a companion adventurer in the world of Azeroth (World of Warcraft).";
+        if (!sharedCard.empty())   sys << " Who you are: " << sharedCard;
+        if (!personalCard.empty()) sys << " Your history with " << req.playerName << ": " << personalCard;
+        if (!req.contextHint.empty()) sys << " " << req.contextHint;
+        sys << " Stay in character. Use only your own spoken words: no narration, no asterisks, "
+            "no out-of-character text. Keep it to one or two short sentences.";
+
+        std::ostringstream usr;
+        if (!history.empty())
+        {
+            usr << "Recent conversation:\n";
+            for (auto const& l : history) usr << l << "\n";
+            usr << "\n";
+        }
+        usr << req.playerName << ": \"" << req.message << "\"\n\nReply as " << req.botName << ":";
+
+        NpcChat_LLMResult res = NpcChat_CallLLM(BuildChatApiConfig(), sys.str(), usr.str());
+        if (!res.success || res.text.empty())
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            AppendHistoryLine(historyPath, req.botName + ": " + res.text);
+        }
+
+        BotSurfaceReply rep;
+        rep.playerGuidRaw = req.playerGuidRaw;
+        rep.botGuidRaw = req.botGuidRaw;
+        rep.kind = req.kind;
+        rep.channelName = req.channelName;
+        rep.text = res.text;
+
+        std::lock_guard<std::mutex> lock(SurfaceReplyMutex());
+        SurfaceReplyQueue().push(std::move(rep));
+    }
+
+    // Capture on MAIN THREAD, hand the worker copies only.
+    inline void DispatchBotSurface(Player* player, Player* bot, SurfaceKind kind,
+        std::string const& channelName, std::string const& contextHint,
+        std::string const& message)
+    {
+        BotSurfaceRequest req;
+        req.playerGuidRaw = player->GetGUID().GetRawValue();
+        req.playerName = player->GetName();
+        req.botGuidRaw = bot->GetGUID().GetRawValue();
+        req.botName = bot->GetName();
+        req.botLevel = bot->GetLevel();
+        req.botGender = BotGenderName(bot->getGender());
+        req.botRace = BotRaceName(bot->getRace());
+        req.botClass = BotClassName(bot->getClass());
+        req.kind = kind;
+        req.channelName = channelName;
+        req.contextHint = contextHint;
+        req.message = message;
+        std::thread(BotSurfaceWorkerRun, std::move(req)).detach();
+    }
+
+    // --- emit (MAIN THREAD, from OnUpdate) -------------------------------------
+    inline void EmitBotSurfaceReplies()
+    {
+        std::queue<BotSurfaceReply> local;
+        {
+            std::lock_guard<std::mutex> lk(SurfaceReplyMutex());
+            if (SurfaceReplyQueue().empty()) return;
+            std::swap(local, SurfaceReplyQueue());
+        }
+
+        while (!local.empty())
+        {
+            BotSurfaceReply& r = local.front();
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(r.botGuidRaw));
+            Player* player = ObjectAccessor::FindPlayer(ObjectGuid(r.playerGuidRaw));
+
+            if (bot && bot->IsInWorld())
+            {
+                if (r.kind == SurfaceKind::GuildMsg)
+                {
+                    if (Guild* g = bot->GetGuild())
+                        g->BroadcastToGuild(bot->GetSession(), false, r.text, LANG_UNIVERSAL); // [AC-API]
+                }
+                else // ChannelMsg
+                {
+                    // Channel::Say needs the bot to be a channel member and Channel::IsOn is
+                    // private in this core, so we can't gate it. Whisper the requester instead:
+                    // reliable, and the natural LFG UX (the recruiter is told directly).
+                    if (player)
+                        bot->Whisper(r.text, LANG_UNIVERSAL, player);
+                }
+            }
+            local.pop();
+        }
+    }
+
+    // --- Guild surface: player-provoked, turn-capped, never initiates ----------
+    inline void HandleBotGuild(Player* player, uint32 /*type*/, Guild* guild, std::string const& text)
+    {
+        if (!GetBotCfg().enable || !GetSurfaceCfg().guildEnable || !guild) return;
+        if (!IsRealPlayerSession(player)) return;
+        if (text.empty() || text[0] == '.') return;
+
+        BotSurfaceCfg const& cfg = GetSurfaceCfg();
+        uint64_t const playerGuid = player->GetGUID().GetRawValue();
+
+        // Provocation = the player named an online guild bot. Tokenize and look each up by name.
+        std::istringstream iss(text);
+        std::string tok;
+        std::set<std::string> seen;
+        while (iss >> tok)
+        {
+            // strip trailing punctuation
+            while (!tok.empty() && !std::isalnum((unsigned char)tok.back())) tok.pop_back();
+            if (tok.size() < 2 || seen.count(tok)) continue;
+            seen.insert(tok);
+
+            Player* bot = ObjectAccessor::FindPlayerByName(tok);   // [AC-API]
+            if (!bot || !IsGenuineBot(bot)) continue;
+            if (bot->GetGuildId() != player->GetGuildId()) continue;
+
+            if (GuildTurnAllowed(playerGuid, bot->GetGUID().GetRawValue(), cfg.guildMaxTurns, cfg.guildWindowSec))
+                DispatchBotSurface(player, bot, SurfaceKind::GuildMsg, "", "", text);
+        }
+    }
+
+    // --- Channel surface: General/Trade, LFG matchmaking + optional ambient ----
+    inline void HandleBotChannel(Player* player, uint32 /*type*/, Channel* channel, std::string const& text)
+    {
+        if (!GetBotCfg().enable || !channel) return;
+        if (!IsRealPlayerSession(player)) return;
+        if (text.empty() || text[0] == '.') return;
+
+        BotSurfaceCfg const& cfg = GetSurfaceCfg();
+        std::string const chName = channel->GetName();   // e.g. "General - Elwynn Forest"
+        std::string const chLow = ToLowerCopy(chName);
+        bool const isGeneral = chLow.find("general") != std::string::npos;
+        bool const isTrade = chLow.find("trade") != std::string::npos;
+        if (!isGeneral && !isTrade) return;
+
+        // LFG matchmaking
+        if (cfg.lfgEnable && ((isGeneral && cfg.lfgGeneral) || (isTrade && cfg.lfgTrade)))
+        {
+            LfgIntent intent = ParseLfgIntent(text);
+            if (intent.isLfg)
+            {
+                std::vector<BotRosterEntry> roster = BuildZoneBotRoster(player);
+                if (BotRosterEntry const* best = MatchBestBot(roster, intent, player->GetLevel(), cfg.levelBracket))
+                {
+                    if (Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(best->guidRaw)))
+                    {
+                        std::string what = best->specName.empty() ? std::string(ClassShort(best->cls)) : best->specName;
+                        std::string hint = "Someone nearby is forming a group and needs a "
+                            + std::string(RoleShort(best->role)) + " (" + what + "). You are that "
+                            + what + " and you are close by. Offer briefly and in character to join.";
+                        DispatchBotSurface(player, bot, SurfaceKind::ChannelMsg, chName, hint, text);
+                    }
+                }
+                return; // treated as an LFG line whether or not a match was found
+            }
+        }
+
+        // Ambient chatter (default off): occasionally one local bot chimes in.
+        if (isGeneral && cfg.ambientChance > 0 && (uint32)(std::rand() % 100) < cfg.ambientChance)
+        {
+            std::vector<BotRosterEntry> roster = BuildZoneBotRoster(player);
+            if (!roster.empty())
+            {
+                // prefer a bot the player already knows, else pick one at random
+                BotRosterEntry const* pick = nullptr;
+                for (auto const& e : roster) if (e.knownToPlayer) { pick = &e; break; }
+                if (!pick) pick = &roster[std::rand() % roster.size()];
+                if (Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(pick->guidRaw)))
+                    DispatchBotSurface(player, bot, SurfaceKind::ChannelMsg, chName, "", text);
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -4926,6 +5762,8 @@ public:
             PLAYERHOOK_CAN_PLAYER_USE_CHAT,
             PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT,
             PLAYERHOOK_CAN_PLAYER_USE_GROUP_CHAT,
+            PLAYERHOOK_CAN_PLAYER_USE_GUILD_CHAT,
+            PLAYERHOOK_CAN_PLAYER_USE_CHANNEL_CHAT,
             PLAYERHOOK_ON_AFTER_UPDATE,
             PLAYERHOOK_ON_LOGOUT
         }) {}
@@ -4935,14 +5773,28 @@ public:
         return HandleNpcChat(player, type, msg);
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Player* /*receiver*/) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Player* receiver) override
     {
+        HandleBotWhisper(player, type, receiver, TrimCopy(msg));
         return HandleNpcChat(player, type, msg);
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Group* /*group*/) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Group* group) override
     {
+        HandleBotGroup(player, type, group, TrimCopy(msg));
         return HandleNpcChat(player, type, msg);
+    }
+
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Guild* guild) override
+    {
+        HandleBotGuild(player, type, guild, TrimCopy(msg));
+        return true;
+    }
+
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Channel* channel) override
+    {
+        HandleBotChannel(player, type, channel, TrimCopy(msg));
+        return true;
     }
 
     void OnPlayerAfterUpdate(Player* player, uint32 diff) override
@@ -5165,6 +6017,11 @@ private:
         Unit* sel = player->GetSelectedUnit();
         Creature* npc = sel ? sel->ToCreature() : nullptr;
 
+        // Bot chat: if the selected target is a genuine bot player, let it answer and stop.
+        if (Player* botTarget = sel ? sel->ToPlayer() : nullptr)
+            if (HandleBotSay(player, botTarget, text))
+                return true;
+
         // No NPC selected: let a nearby NPC field the say/yell, if enabled. A hostile-sounding yell
         // near enemies is answered by the nearest enemy; otherwise the nearest friendly NPC answers.
         if ((!npc || !npc->IsAlive()) && g_UntargetedChatEnabled)
@@ -5344,6 +6201,9 @@ public:
 
             local.pop();
         }
+
+        EmitBotReplies();
+        EmitBotSurfaceReplies();
 
         // Cached proximity bark checks run from PlayerScript::OnPlayerAfterUpdate.
         // This branch exposes no sWorld->GetAllSessions() on IWorld, and player hooks
