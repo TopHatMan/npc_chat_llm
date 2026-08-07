@@ -4843,32 +4843,31 @@ namespace
         return p && p->GetSession() && !p->GetSession()->IsBot();
     }
 
-    // --- lazy config (NpcChat.Bot.*) -------------------------------------------
+    // --- config (NpcChat.Bot.*) ------------------------------------------------
+    // Read these values when a conversation is dispatched so `.npcc reload` applies
+    // immediately. Character cards themselves are always read fresh from disk.
     struct BotCfg
     {
-        bool  enable = false;
-        bool  replyWhisper = true;
-        bool  replyPartyRaid = true;
-        bool  replyTarget = true;
-        float triggerRange = 25.0f;
-        int   historyTail = 20;
-        bool  generateSharedCard = true;
+        bool        enable = false;
+        bool        replyWhisper = true;
+        bool        replyPartyRaid = true;
+        bool        replyTarget = true;
+        float       triggerRange = 25.0f;
+        int         historyTail = 20;
+        std::string characterCardsPath = "./characters";
     };
 
-    inline BotCfg const& GetBotCfg()
+    inline BotCfg GetBotCfg()
     {
-        static BotCfg cfg;
-        static std::once_flag once;
-        std::call_once(once, []
-            {
-                cfg.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Enable", false);
-                cfg.replyWhisper = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyWhisper", true);
-                cfg.replyPartyRaid = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyPartyRaid", true);
-                cfg.replyTarget = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyTarget", true);
-                cfg.triggerRange = sConfigMgr->GetOption<float>("NpcChat.Bot.TriggerRange", 25.0f);
-                cfg.historyTail = sConfigMgr->GetOption<int32>("NpcChat.Bot.HistoryMaxLines", 20);
-                cfg.generateSharedCard = sConfigMgr->GetOption<bool>("NpcChat.Bot.GenerateSharedCard", true);
-            });
+        BotCfg cfg;
+        cfg.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Enable", false);
+        cfg.replyWhisper = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyWhisper", true);
+        cfg.replyPartyRaid = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyPartyRaid", true);
+        cfg.replyTarget = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyTarget", true);
+        cfg.triggerRange = sConfigMgr->GetOption<float>("NpcChat.Bot.TriggerRange", 25.0f);
+        cfg.historyTail = sConfigMgr->GetOption<int32>("NpcChat.Bot.HistoryMaxLines", 20);
+        cfg.characterCardsPath = sConfigMgr->GetOption<std::string>(
+            "NpcChat.Bot.CharacterCardsPath", "./characters");
         return cfg;
     }
 
@@ -4898,32 +4897,33 @@ namespace
         }
     }
 
-    // --- bot file paths (mirror your NPC shared/personal layout) ---------------
+    // --- bot character cards + simple per-player history --------------------------
+    // Character identity is name-based on purpose: this matches mod-playerbots-characters
+    // (`characters/ExactCharacterName.card.txt`) and survives bot GUID changes.
+    // GUIDs remain useful for private conversation history only.
     inline std::string BotBase(std::string const& botName, uint64_t botGuidRaw)
     {
         return SanitizeName(botName) + "_" + std::to_string(botGuidRaw);
     }
-    inline std::string BotSharedCardFilePath(std::string const& botName, uint64_t botGuidRaw)
+
+    inline std::string BotCharacterCardFilePath(std::string const& botName)
     {
-        return g_HistoryPath + "/bots/shared/" + BotBase(botName, botGuidRaw) + ".card";
+        return (std::filesystem::path(GetBotCfg().characterCardsPath) /
+            (botName + ".card.txt")).string();
     }
-    inline std::string BotPersonalCardFilePath(std::string const& playerName, uint64_t playerGuidRaw,
-        std::string const& botName, uint64_t botGuidRaw)
-    {
-        return g_HistoryPath + "/bots/personal/" + PlayerHistoryBase(playerName, playerGuidRaw) +
-            "/" + BotBase(botName, botGuidRaw) + ".card";
-    }
+
     inline std::string BotPersonalHistoryFilePath(std::string const& playerName, uint64_t playerGuidRaw,
         std::string const& botName, uint64_t botGuidRaw)
     {
         return g_HistoryPath + "/bots/personal/" + PlayerHistoryBase(playerName, playerGuidRaw) +
             "/" + BotBase(botName, botGuidRaw) + ".history";
     }
+
     inline void EnsureBotChatDirectories()
     {
         try
         {
-            std::filesystem::create_directories(g_HistoryPath + "/bots/shared");
+            std::filesystem::create_directories(GetBotCfg().characterCardsPath);
             std::filesystem::create_directories(g_HistoryPath + "/bots/personal");
         }
         catch (std::exception const&) {}
@@ -4968,35 +4968,53 @@ namespace
         return ss.str();
     }
 
-    // One-time shared identity card, generated from the bot's real character.
-    inline std::string GenerateBotSharedCard(BotChatRequest const& req)
+    // PBC-compatible starter file. This is deliberately NOT generated by an LLM.
+    // It exists only so every bot gets an immediately editable character card on first contact.
+    inline std::string BuiltInBotCharacterCardTemplate()
     {
-        std::string sys = "You write short third-person character descriptions for a "
-            "World of Warcraft roleplay server. Output only the description, no dialogue.";
-        std::ostringstream usr;
-        usr << "Write a 3 to 5 sentence description of " << req.botName << ", "
-            << BuildBotPersona(req) << ". Cover personality, background, and how they "
-            << "speak. Do not mention game mechanics, players, or that they are a bot.";
+        return
+            "You are {char_name}, a {char_gender} {char_race} {char_class}.\n\n"
+            "You are an adventurer living in Azeroth. Your personality, background, mannerisms, "
+            "beliefs, likes, dislikes, and relationships can be described here.\n\n"
+            "Stay in character when speaking.";
+    }
 
-        NpcChat_ApiConfig cfg = BuildGenerationApiConfig();
-        NpcChat_LLMResult res = NpcChat_CallLLM(cfg, sys, usr.str());
-        if (res.success && !res.text.empty())
-            return res.text;
+    // Caller holds g_FileMutex. Read the card every conversation so a manual edit is
+    // visible on the very next line the bot speaks. Never overwrite an existing file.
+    inline std::string LoadBotCharacterCard(std::string const& botName)
+    {
+        std::string const path = BotCharacterCardFilePath(botName);
+        std::string card = ReadWholeTextFile(path);
 
-        // Fallback so the bot still has an identity if generation fails.
-        return req.botName + " is " + BuildBotPersona(req) + ", a seasoned adventurer of Azeroth.";
+        if (card.empty())
+        {
+            WriteWholeTextFile(path, BuiltInBotCharacterCardTemplate(), false);
+            card = ReadWholeTextFile(path);
+        }
+
+        // If the path cannot be written (or an intentionally empty file exists),
+        // still give the current conversation the harmless built-in template.
+        return card.empty() ? BuiltInBotCharacterCardTemplate() : card;
+    }
+
+    inline std::string ExpandBotCharacterCard(BotChatRequest const& req, std::string card)
+    {
+        ReplaceAllInPlace(card, "{char_name}", req.botName);
+        ReplaceAllInPlace(card, "{char_gender}", req.botGender);
+        ReplaceAllInPlace(card, "{char_race}", req.botRace);
+        ReplaceAllInPlace(card, "{char_class}", req.botClass);
+        ReplaceAllInPlace(card, "{char_level}", std::to_string(req.botLevel));
+        return card;
     }
 
     inline std::string BuildBotSystemPrompt(BotChatRequest const& req,
-        std::string const& sharedCard, std::string const& personalCard)
+        std::string const& characterCard)
     {
         std::ostringstream ss;
         ss << "You are " << req.botName << ", " << BuildBotPersona(req)
             << ", adventuring in Azeroth (World of Warcraft) as a companion to fellow players.\n";
-        if (!sharedCard.empty())
-            ss << "Who you are: " << sharedCard << "\n";
-        if (!personalCard.empty())
-            ss << "Your history with " << req.playerName << ": " << personalCard << "\n";
+        if (!characterCard.empty())
+            ss << "\nCharacter card:\n" << characterCard << "\n";
         ss << "Stay fully in character. Use only your own spoken words: no narration, no "
             "asterisks, no out-of-character text, no game mechanics. Keep replies to one or "
             "two short sentences suitable for a single line of in-game chat.";
@@ -5020,41 +5038,26 @@ namespace
     // --- worker ----------------------------------------------------------------
     inline void BotWorkerRun(BotChatRequest req)
     {
-        std::string const sharedCardPath = BotSharedCardFilePath(req.botName, req.botGuidRaw);
-        std::string const personalCardPath = BotPersonalCardFilePath(req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
-        std::string const historyPath = BotPersonalHistoryFilePath(req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
-
-        BotCfg const& cfg = GetBotCfg();
+        std::string const historyPath = BotPersonalHistoryFilePath(
+            req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
+        BotCfg const cfg = GetBotCfg();
 
         std::deque<std::string> history;
-        std::string sharedCard, personalCard;
+        std::string characterCard;
 
         {
             std::lock_guard<std::mutex> lock(g_FileMutex);
             EnsureBotChatDirectories();
-            sharedCard = ReadWholeTextFile(sharedCardPath);
-            personalCard = ReadWholeTextFile(personalCardPath);
+            characterCard = LoadBotCharacterCard(req.botName);
             history = LoadHistoryTail(historyPath, cfg.historyTail);
             AppendHistoryLine(historyPath, req.playerName + ": " + req.message);
         }
 
-        // First contact: generate the shared identity card (LLM, once), stub the personal card.
-        if (sharedCard.empty() && cfg.generateSharedCard)
-        {
-            sharedCard = GenerateBotSharedCard(req);   // outside the mutex -- do not block file IO
-            std::lock_guard<std::mutex> lock(g_FileMutex);
-            WriteWholeTextFile(sharedCardPath, sharedCard, false); // false = keep existing if another worker won the race
-        }
-        if (personalCard.empty())
-        {
-            personalCard = req.botName + " and " + req.playerName + " have recently begun talking.";
-            std::lock_guard<std::mutex> lock(g_FileMutex);
-            WriteWholeTextFile(personalCardPath, personalCard, false);
-        }
+        characterCard = ExpandBotCharacterCard(req, std::move(characterCard));
 
         NpcChat_ApiConfig apiCfg = BuildChatApiConfig();
         NpcChat_LLMResult res = NpcChat_CallLLM(apiCfg,
-            BuildBotSystemPrompt(req, sharedCard, personalCard),
+            BuildBotSystemPrompt(req, characterCard),
             BuildBotUserPrompt(req, history));
 
         if (!res.success || res.text.empty())
@@ -5097,7 +5100,7 @@ namespace
     // Whisper a bot -> it whispers back. `text` is the already-trimmed message.
     inline bool HandleBotWhisper(Player* player, uint32 type, Player* receiver, std::string const& text)
     {
-        BotCfg const& cfg = GetBotCfg();
+        BotCfg const cfg = GetBotCfg();
         if (!cfg.enable || !cfg.replyWhisper) return false;
         if (type != CHAT_MSG_WHISPER) return false;
         if (!IsRealPlayerSession(player)) return false;   // only real senders
@@ -5110,7 +5113,7 @@ namespace
     // Name bot(s) in party/raid -> each named genuine bot in the group replies.
     inline void HandleBotGroup(Player* player, uint32 type, Group* group, std::string const& text)
     {
-        BotCfg const& cfg = GetBotCfg();
+        BotCfg const cfg = GetBotCfg();
         if (!cfg.enable || !cfg.replyPartyRaid || !group) return;
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
@@ -5138,7 +5141,7 @@ namespace
     // Target a bot and /say -> it answers. `text` is the already-trimmed message.
     inline bool HandleBotSay(Player* player, Player* bot, std::string const& text)
     {
-        BotCfg const& cfg = GetBotCfg();
+        BotCfg const cfg = GetBotCfg();
         if (!cfg.enable || !cfg.replyTarget) return false;
         if (!IsRealPlayerSession(player) || !IsGenuineBot(bot)) return false;
         if (!bot->IsAlive() || !player->IsWithinDist(bot, cfg.triggerRange, true)) return false;
@@ -5402,7 +5405,8 @@ namespace
         return true;
     }
 
-    // --- config (lazy) ---------------------------------------------------------
+    // --- bot surface config ------------------------------------------------------
+    // Like BotCfg, read on use so `.npcc reload` is effective for guild/LFG settings.
     struct BotSurfaceCfg
     {
         bool   lfgEnable = true;
@@ -5414,21 +5418,18 @@ namespace
         int    guildMaxTurns = 4;
         int    guildWindowSec = 300;
     };
-    inline BotSurfaceCfg const& GetSurfaceCfg()
+
+    inline BotSurfaceCfg GetSurfaceCfg()
     {
-        static BotSurfaceCfg c;
-        static std::once_flag o;
-        std::call_once(o, []
-            {
-                c.lfgEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Enable", true);
-                c.levelBracket = sConfigMgr->GetOption<int32>("NpcChat.Bot.Lfg.LevelBracket", 8);
-                c.lfgGeneral = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.General", true);
-                c.lfgTrade = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Trade", false);
-                c.ambientChance = sConfigMgr->GetOption<uint32>("NpcChat.Bot.General.Chance", 0);
-                c.guildEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Guild.Enable", true);
-                c.guildMaxTurns = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.MaxTurns", 4);
-                c.guildWindowSec = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.WindowSec", 300);
-            });
+        BotSurfaceCfg c;
+        c.lfgEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Enable", true);
+        c.levelBracket = sConfigMgr->GetOption<int32>("NpcChat.Bot.Lfg.LevelBracket", 8);
+        c.lfgGeneral = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.General", true);
+        c.lfgTrade = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Trade", false);
+        c.ambientChance = sConfigMgr->GetOption<uint32>("NpcChat.Bot.General.Chance", 0);
+        c.guildEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Guild.Enable", true);
+        c.guildMaxTurns = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.MaxTurns", 4);
+        c.guildWindowSec = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.WindowSec", 300);
         return c;
     }
 
@@ -5462,45 +5463,40 @@ namespace
     // --- worker (isolated; reuses card/history/LLM leaf helpers) ---------------
     inline void BotSurfaceWorkerRun(BotSurfaceRequest req)
     {
-        std::string persona = "a level " + std::to_string(req.botLevel);
-        if (!req.botGender.empty()) persona += " " + req.botGender;
-        if (!req.botRace.empty())   persona += " " + req.botRace;
-        if (!req.botClass.empty())  persona += " " + req.botClass;
-
-        std::string const sharedCardPath = BotSharedCardFilePath(req.botName, req.botGuidRaw);
-        std::string const personalCardPath = BotPersonalCardFilePath(req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
-        std::string const historyPath = BotPersonalHistoryFilePath(req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
+        std::string const historyPath = BotPersonalHistoryFilePath(
+            req.playerName, req.playerGuidRaw, req.botName, req.botGuidRaw);
+        BotCfg const cfg = GetBotCfg();
 
         std::deque<std::string> history;
-        std::string sharedCard, personalCard;
+        std::string characterCard;
         {
             std::lock_guard<std::mutex> lock(g_FileMutex);
             EnsureBotChatDirectories();
-            sharedCard = ReadWholeTextFile(sharedCardPath);
-            personalCard = ReadWholeTextFile(personalCardPath);
-            history = LoadHistoryTail(historyPath, 20);
+            characterCard = LoadBotCharacterCard(req.botName);
+            history = LoadHistoryTail(historyPath, cfg.historyTail);
             AppendHistoryLine(historyPath, req.playerName + ": " + req.message);
         }
 
-        std::ostringstream sys;
-        sys << "You are " << req.botName << ", " << persona
-            << ", a companion adventurer in the world of Azeroth (World of Warcraft).";
-        if (!sharedCard.empty())   sys << " Who you are: " << sharedCard;
-        if (!personalCard.empty()) sys << " Your history with " << req.playerName << ": " << personalCard;
-        if (!req.contextHint.empty()) sys << " " << req.contextHint;
-        sys << " Stay in character. Use only your own spoken words: no narration, no asterisks, "
-            "no out-of-character text. Keep it to one or two short sentences.";
+        // Reuse the exact same character-card and conversation prompt path as whisper,
+        // target say, party and raid. Guild/LFG only add a small situation hint.
+        BotChatRequest promptReq;
+        promptReq.playerGuidRaw = req.playerGuidRaw;
+        promptReq.playerName = req.playerName;
+        promptReq.botGuidRaw = req.botGuidRaw;
+        promptReq.botName = req.botName;
+        promptReq.botLevel = req.botLevel;
+        promptReq.botGender = req.botGender;
+        promptReq.botRace = req.botRace;
+        promptReq.botClass = req.botClass;
+        promptReq.message = req.message;
 
-        std::ostringstream usr;
-        if (!history.empty())
-        {
-            usr << "Recent conversation:\n";
-            for (auto const& l : history) usr << l << "\n";
-            usr << "\n";
-        }
-        usr << req.playerName << ": \"" << req.message << "\"\n\nReply as " << req.botName << ":";
+        characterCard = ExpandBotCharacterCard(promptReq, std::move(characterCard));
+        std::string systemPrompt = BuildBotSystemPrompt(promptReq, characterCard);
+        if (!req.contextHint.empty())
+            systemPrompt += "\n\nCurrent situation:\n" + req.contextHint;
 
-        NpcChat_LLMResult res = NpcChat_CallLLM(BuildChatApiConfig(), sys.str(), usr.str());
+        NpcChat_LLMResult res = NpcChat_CallLLM(
+            BuildChatApiConfig(), systemPrompt, BuildBotUserPrompt(promptReq, history));
         if (!res.success || res.text.empty())
             return;
 
@@ -5584,7 +5580,7 @@ namespace
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
 
-        BotSurfaceCfg const& cfg = GetSurfaceCfg();
+        BotSurfaceCfg const cfg = GetSurfaceCfg();
         uint64_t const playerGuid = player->GetGUID().GetRawValue();
 
         // Provocation = the player named an online guild bot. Tokenize and look each up by name.
@@ -5614,7 +5610,7 @@ namespace
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
 
-        BotSurfaceCfg const& cfg = GetSurfaceCfg();
+        BotSurfaceCfg const cfg = GetSurfaceCfg();
         std::string const chName = channel->GetName();   // e.g. "General - Elwynn Forest"
         std::string const chLow = ToLowerCopy(chName);
         bool const isGeneral = chLow.find("general") != std::string::npos;
