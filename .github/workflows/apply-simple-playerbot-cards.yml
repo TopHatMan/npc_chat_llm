@@ -1,0 +1,36 @@
+name: Apply simple playerbot character-card patch
+
+on:
+  push:
+    branches:
+      - agent/simple-playerbot-character-cards
+    paths:
+      - scripts/apply_simple_bot_cards_patch.py
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/simple-playerbot-character-cards
+
+      - name: Apply focused source patch
+        run: python scripts/apply_simple_bot_cards_patch.py
+
+      - name: Commit source update
+        shell: bash
+        run: |
+          if git diff --quiet -- src/mod_npcchat.cpp; then
+            echo "No source changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/mod_npcchat.cpp
+          git commit -m "Use simple PBC-compatible playerbot character cards"
+          git push origin HEAD:agent/simple-playerbot-character-cards
