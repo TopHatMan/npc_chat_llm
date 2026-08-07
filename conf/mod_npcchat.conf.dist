@@ -1,4 +1,4 @@
-w###################################################################################################
+###################################################################################################
 # NPC Chat LLM - current combined feature config
 # Safe defaults: all proximity/automatic bark systems are OFF.
 # Manual .npcc commands still work when NpcChat.Enable = 1.
@@ -237,14 +237,25 @@ NpcChat.SubPrompt.ImportOnStartup = 1
 ###################################################################################################
 # PLAYERBOT CHAT  - talk to playerbots (only genuine bots ever reply; real players never do)
 #
-# Reuses the main NpcChat.* API/model above. Bot files live under:
-#   <NpcChat.HistoryPath>/bots/shared/    identity cards, generated on first contact
-#   <NpcChat.HistoryPath>/bots/personal/  {player}__{bot} history + personal cards
+# Reuses the main NpcChat.* API/model above.
+# Character identity uses the same simple card convention as mod-playerbots-characters:
+#   ./characters/ExactCharacterName.card.txt
+#
+# If a bot has no card when first spoken to, npc_chat_llm creates a fixed editable template locally.
+# No LLM request is spent generating that file. Existing cards are never overwritten, and the card
+# is read again on every conversation so manual edits take effect on the very next bot response.
+#
+# Personal conversation history stays separate under:
+#   <NpcChat.HistoryPath>/bots/personal/<player>/<bot-name>_<bot-guid>.history
 ###################################################################################################
 
 # Master switch for ALL bot-chat surfaces (whisper / party-raid / target / LFG / guild).
 # Code default is 0; set to 1 to run the feature.
 NpcChat.Bot.Enable = 1
+
+# Directory containing PBC-compatible ExactCharacterName.card.txt files.
+# Point both modules at this same directory if you ever switch between them. Default: ./characters
+NpcChat.Bot.CharacterCardsPath = ./characters
 
 # Whisper a bot -> it whispers back. Default: 1
 NpcChat.Bot.ReplyWhisper = 1
@@ -260,10 +271,6 @@ NpcChat.Bot.TriggerRange = 25.0
 
 # Recent lines of (player+bot) history fed back to the model. Main cost dial. Default: 20
 NpcChat.Bot.HistoryMaxLines = 20
-
-# On first contact, generate a one-time shared identity card via the LLM.
-# 0 = use a plain template instead (no generation cost). Default: 1
-NpcChat.Bot.GenerateSharedCard = 1
 
 
 ###################################################################################################
