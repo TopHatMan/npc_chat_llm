@@ -5482,6 +5482,24 @@ namespace
             AppendHistoryLine(historyPath, req.playerName + ": " + req.message);
         }
 
+        // First contact via guild/LFG: write a cheap basic-facts gestalt card (no LLM) so the
+        // bot has a seed to roleplay from, and stub the personal card. A later whisper/target
+        // can enrich the shared card. This is the "not much, but it's something" default.
+        if (sharedCard.empty())
+        {
+            sharedCard = req.botName + " is " + persona +
+                ", an adventurer of Azeroth. This is only a rough sketch -- give them a natural "
+                "personality and manner of speaking.";
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            WriteWholeTextFile(sharedCardPath, sharedCard, false);
+        }
+        if (personalCard.empty())
+        {
+            personalCard = req.botName + " and " + req.playerName + " have recently begun talking.";
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            WriteWholeTextFile(personalCardPath, personalCard, false);
+        }
+
         std::ostringstream sys;
         sys << "You are " << req.botName << ", " << persona
             << ", a companion adventurer in the world of Azeroth (World of Warcraft).";
