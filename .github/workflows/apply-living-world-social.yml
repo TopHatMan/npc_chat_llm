@@ -20,6 +20,19 @@ jobs:
         with:
           ref: agent/living-guild-raid-npc-whispers
 
+      - name: Normalize merged config marker
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('conf/mod_npcchat.conf.dist')
+          s = p.read_text(encoding='utf-8')
+          old = '# PLAYERBOT LFG  -  "LFM heals" in General finds a matching nearby bot who answers (via whisper)'
+          if old not in s:
+              raise SystemExit('Expected PLAYERBOT LFG header not found')
+          p.write_text(s.replace(old, '# PLAYERBOT LFG', 1), encoding='utf-8')
+          PY
+
       - name: Apply focused social patch
         run: python scripts/apply_living_world_social_patch.py
 
