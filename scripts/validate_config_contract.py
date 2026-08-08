@@ -7,6 +7,7 @@ from an AzerothCore module checkout:
     python scripts/validate_config_contract.py
 
 It catches the kind of configuration drift that accumulated during early iteration:
+- missing required [worldserver] module-config header
 - duplicate active NpcChat.* keys in mod_npcchat.conf.dist
 - source GetOption() keys missing from the canonical config
 - canonical config keys no longer read anywhere in source
@@ -73,6 +74,16 @@ def main() -> int:
     stale_config = sorted(config_set - source_set)
 
     failed = False
+
+    # AzerothCore module configs must identify the worldserver section. Without this
+    # header the file can exist in configs/modules/ yet its NpcChat.* values never load.
+    if not conf.startswith("[worldserver]\n"):
+        failed = True
+        print(
+            "ERROR: canonical mod_npcchat.conf.dist must start with [worldserver] "
+            "so AzerothCore loads it as a worldserver module config."
+        )
+
     if duplicates:
         failed = True
         print("ERROR: duplicate active config keys:")
@@ -100,7 +111,7 @@ def main() -> int:
     if failed:
         return 1
 
-    print("NpcChat config contract OK.")
+    print("NpcChat config contract OK (including required [worldserver] header).")
     return 0
 
 

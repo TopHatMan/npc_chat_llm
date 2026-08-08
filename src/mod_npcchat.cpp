@@ -42,7 +42,8 @@
 #include "AiFactory.h"      // GetPlayerSpecTab
 #include "ChatHelper.h"     // FormatClass (readable spec)
 #include "Guild.h"          // BroadcastToGuild
-#include "Channel.h"        // Channel::Say / IsOn
+#include "Channel.h"        // Channel::Say
+#include "ChannelMgr.h"     // find General/Trade channel on world thread
 #include <set>
 
 #include <algorithm>
@@ -148,10 +149,10 @@ namespace
     // the normal chat model and real personal chat history, so keep the chance/cooldowns conservative.
     bool        g_HistoryWhispersEnabled = true;
     float       g_HistoryWhispersTriggerDistance = 18.0f;
-    int         g_HistoryWhispersChancePct = 12;
-    int         g_HistoryWhispersPlayerCooldownSec = 300;
-    int         g_HistoryWhispersPairCooldownSec = 900;
-    int         g_HistoryWhispersScanIntervalMs = 5000;
+    int         g_HistoryWhispersChancePct = 5;
+    int         g_HistoryWhispersPlayerCooldownSec = 600;
+    int         g_HistoryWhispersPairCooldownSec = 1800;
+    int         g_HistoryWhispersScanIntervalMs = 8000;
     int         g_HistoryWhispersHistoryMaxLines = 8;
 
     // Cached hostile first-talk barks: elite/intelligent enemies can speak first
@@ -323,10 +324,10 @@ namespace
 
         g_HistoryWhispersEnabled = sConfigMgr->GetOption<bool>("NpcChat.HistoryWhispers.Enabled", true);
         g_HistoryWhispersTriggerDistance = sConfigMgr->GetOption<float>("NpcChat.HistoryWhispers.TriggerDistance", 18.0f);
-        g_HistoryWhispersChancePct = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ChancePct", 12);
-        g_HistoryWhispersPlayerCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PlayerCooldownSec", 300);
-        g_HistoryWhispersPairCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PairCooldownSec", 900);
-        g_HistoryWhispersScanIntervalMs = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ScanIntervalMs", 5000);
+        g_HistoryWhispersChancePct = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ChancePct", 5);
+        g_HistoryWhispersPlayerCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PlayerCooldownSec", 600);
+        g_HistoryWhispersPairCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PairCooldownSec", 1800);
+        g_HistoryWhispersScanIntervalMs = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ScanIntervalMs", 8000);
         g_HistoryWhispersHistoryMaxLines = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.HistoryMaxLines", 8);
         g_HistoryWhispersChancePct = std::max(0, std::min(100, g_HistoryWhispersChancePct));
         g_HistoryWhispersScanIntervalMs = std::max(1000, g_HistoryWhispersScanIntervalMs);
@@ -5204,6 +5205,13 @@ namespace
     // --- config (NpcChat.Bot.*) ------------------------------------------------
     // Read these values when a conversation is dispatched so `.npcc reload` applies
     // immediately. Character cards themselves are always read fresh from disk.
+    inline std::string const& DefaultBotRpBlacklist()
+    {
+        static std::string const value =
+            "t ,c ,r ,items,autogear,talents,reset botAI,summon,los,release,revive,leave,attack,follow,flee,stay,runaway,grind,disperse,give leader,spells,cast ,quests,accept,drop,talk,reset,ss ,trainer,rti,rtsc,do ,ll ,e ,ue ,nc ,open,destroy,s ,b ,bank,gb ,u ,co ,ELVUI_VERSIONCHK,Asked,DPSMate_,LibGroupTalents,BLT,oRA3,Skada,HealBot,hbComms,questie,pfQuest,DBMv4-Ver,BWVQ3,add,remove,reset ai,report,state,help,log,stats,tank,offtank,healer,cc ,damage,boost,passive,defensive,aggressive,stay,guard,free,follow,assist,pet,stance,formation,rpg,emote,cheer,applaud,drink,eat,dance,attackers,reset instances,home,zone,who ,who,pos ,tele,grind,loot,quest,trainer,travel,teleport,homebind,unfollow,invite,uninvite,join,leave,leader,ready,release,save,update,reset talents,gear,trade,mail,ah ,ahscan,ahbid,ahbuy,ahsell,ahcancel,bag,repair,vendor,train,spells,reset spells,learn,unlearn,cast,uncast,use ,move,go ,look,stop,turn,face,wait,party,followleader,stayleader,moveleader,info,distance,debug,reset path,reset state,reset all,reset dungeon,reset raid,zone info,LHC40,RECOUNT,GTFO_v,Altoholic,DS_,Crb,Crb ,maintenance ,DataStore";
+        return value;
+    }
+
     struct BotCfg
     {
         bool        enable = false;
@@ -5213,6 +5221,7 @@ namespace
         float       triggerRange = 25.0f;
         int         historyTail = 20;
         std::string characterCardsPath = "./characters";
+        std::string blacklist = DefaultBotRpBlacklist();
     };
 
     inline BotCfg GetBotCfg()
@@ -5226,7 +5235,44 @@ namespace
         cfg.historyTail = sConfigMgr->GetOption<int32>("NpcChat.Bot.HistoryMaxLines", 20, false);
         cfg.characterCardsPath = sConfigMgr->GetOption<std::string>(
             "NpcChat.Bot.CharacterCardsPath", "./characters", false);
+        cfg.blacklist = sConfigMgr->GetOption<std::string>(
+            "NpcChat.Bot.Blacklist", DefaultBotRpBlacklist(), false);
         return cfg;
+    }
+
+    // PBC-compatible prefix blacklist. Leading formatting whitespace after a comma is ignored,
+    // but trailing literal spaces are preserved because `t ` and `t` intentionally mean
+    // different things in the Playerbots command vocabulary. Matching is case-insensitive.
+    inline bool IsBotRpBlacklisted(std::string const& text, std::string const& rawBlacklist)
+    {
+        if (text.empty() || rawBlacklist.empty())
+            return false;
+
+        std::string const hay = ToLowerCopy(text);
+        size_t start = 0;
+        while (start <= rawBlacklist.size())
+        {
+            size_t end = rawBlacklist.find(',', start);
+            std::string prefix = rawBlacklist.substr(
+                start, end == std::string::npos ? std::string::npos : end - start);
+
+            while (!prefix.empty() && (prefix.front() == ' ' || prefix.front() == '\t'))
+                prefix.erase(prefix.begin());
+            while (!prefix.empty() && (prefix.back() == '\r' || prefix.back() == '\n' || prefix.back() == '\t'))
+                prefix.pop_back();
+
+            if (!prefix.empty())
+            {
+                std::string const needle = ToLowerCopy(prefix);
+                if (hay.rfind(needle, 0) == 0)
+                    return true;
+            }
+
+            if (end == std::string::npos)
+                break;
+            start = end + 1;
+        }
+        return false;
     }
 
 
@@ -5481,7 +5527,10 @@ namespace
             ss << "\nCharacter card:\n" << characterCard << "\n";
         ss << "Stay fully in character. Use only your own spoken words: no narration, no "
             "asterisks, no out-of-character text, no game mechanics. Keep replies to one or "
-            "two short sentences suitable for a single line of in-game chat.";
+            "two short sentences suitable for a single line of in-game chat. "
+            "Ignore addon/protocol traffic completely, including encoded synchronization strings, "
+            "version checks, addon payloads, and other machine-to-machine text. Treat those lines "
+            "as invisible: never mention, interpret, answer, or roleplay about them.";
         return ss.str();
     }
 
@@ -5650,6 +5699,8 @@ namespace
                 alts.push_back(bot);
         }
 
+        bool const randomOnlyPool = named.empty() && alts.empty() && !randoms.empty();
+
         std::vector<Player*> out;
         auto addUnique = [&](Player* bot)
         {
@@ -5674,7 +5725,10 @@ namespace
 
         while (static_cast<int>(out.size()) < maxSpeakers && !alts.empty())
             addUnique(TakeRandomBot(alts));
-        while (static_cast<int>(out.size()) < maxSpeakers && out.empty() && !randoms.empty())
+
+        // If the entire eligible pool is random Playerbots, it is still valid to use the
+        // configured speaker cap. The old out.empty() condition limited these groups to one voice.
+        while (static_cast<int>(out.size()) < maxSpeakers && randomOnlyPool && !randoms.empty())
             addUnique(TakeRandomBot(randoms));
 
         return out;
@@ -5734,8 +5788,11 @@ namespace
                 user << "\n";
             }
             user << "Conversation so far:\n" << conversation
-                << "\n\nAdd one short natural line as " << turn.botName
-                << ". If you truly have nothing to add, output exactly [SKIP].";
+                << "\n\nAdd one short natural line as " << turn.botName;
+            if (req.channel == BotSocialChannel::Guild)
+                user << ". You were selected to participate in guild chat, so give a natural in-character reply; do not output [SKIP].";
+            else
+                user << ". If you truly have nothing to add, output exactly [SKIP].";
 
             NpcChat_LLMResult res = NpcChat_CallBackgroundLLM(BuildChatApiConfig(), system, user.str(), "bot-social");
             std::string line = TrimCopy(res.text);
@@ -5756,6 +5813,203 @@ namespace
             std::lock_guard<std::mutex> lock(BotSocialReplyMutex());
             BotSocialReplyQueue().push(std::move(reply));
         }
+    }
+
+
+    // --- autonomous guild ambience ----------------------------------------------
+    struct GuildAmbientCfg
+    {
+        bool enable = true;
+        uint32 minIntervalSec = 90;
+        uint32 maxIntervalSec = 240;
+        int maxSpeakers = 2;
+        uint32 randomBotChancePct = 15;
+        int historyTail = 12;
+    };
+
+    inline GuildAmbientCfg GetGuildAmbientCfg()
+    {
+        GuildAmbientCfg c;
+        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.GuildAmbient.Enable", true, false);
+        c.minIntervalSec = std::max<uint32>(15,
+            sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildAmbient.MinIntervalSec", 90, false));
+        c.maxIntervalSec = std::max<uint32>(c.minIntervalSec,
+            sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildAmbient.MaxIntervalSec", 240, false));
+        c.maxSpeakers = std::max(1, std::min(3,
+            sConfigMgr->GetOption<int32>("NpcChat.Bot.GuildAmbient.MaxSpeakers", 2, false)));
+        c.randomBotChancePct = std::min<uint32>(100,
+            sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildAmbient.RandomBotChancePct", 15, false));
+        c.historyTail = std::max(0, std::min(30,
+            sConfigMgr->GetOption<int32>("NpcChat.Bot.GuildAmbient.HistoryMaxLines", 12, false)));
+        return c;
+    }
+
+    inline std::map<uint32, time_t>& GuildAmbientNextAt()
+    {
+        static std::map<uint32, time_t> nextAt;
+        return nextAt;
+    }
+
+    inline uint32 GuildAmbientDelay(GuildAmbientCfg const& cfg)
+    {
+        if (cfg.maxIntervalSec <= cfg.minIntervalSec)
+            return cfg.minIntervalSec;
+        uint32 const span = cfg.maxIntervalSec - cfg.minIntervalSec + 1;
+        return cfg.minIntervalSec + static_cast<uint32>(std::rand()) % span;
+    }
+
+    inline std::string BotGuildAmbientHistoryFilePath(uint32 guildId)
+    {
+        return g_HistoryPath + "/bots/guild/" + std::to_string(guildId) + ".history";
+    }
+
+    struct BotGuildAmbientConversationRequest
+    {
+        uint32 guildId = 0;
+        int historyTail = 12;
+        std::vector<BotChatRequest> turns;
+    };
+
+    inline void BotGuildAmbientConversationWorker(BotGuildAmbientConversationRequest req)
+    {
+        std::string const historyPath = BotGuildAmbientHistoryFilePath(req.guildId);
+        std::deque<std::string> recentGuildHistory;
+        {
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            try { std::filesystem::create_directories(g_HistoryPath + "/bots/guild"); }
+            catch (std::exception const&) {}
+            recentGuildHistory = LoadHistoryTail(historyPath, req.historyTail);
+        }
+
+        std::string conversation;
+        for (size_t i = 0; i < req.turns.size(); ++i)
+        {
+            BotChatRequest turn = req.turns[i];
+            std::string card;
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                EnsureBotChatDirectories();
+                card = LoadBotCharacterCard(turn.botName);
+            }
+            card = ExpandBotCharacterCard(turn, std::move(card));
+
+            std::string system = BuildBotSystemPrompt(turn, card);
+            system += "\n\nYou are casually participating in guild chat without being directly addressed by a player. "
+                "Sound like an adventurer who actually belongs to this guild. Keep it short and ordinary. "
+                "Good topics include where you are headed, questing, dungeons, professions, supplies, gear, "
+                "travel, asking what guildmates are doing, or a light joke. Do not invent major server events, "
+                "boss kills, rare loot drops, emergencies, or facts you were not given.";
+
+            std::ostringstream user;
+            if (!recentGuildHistory.empty())
+            {
+                user << "Recent ambient guild chat:\n";
+                for (std::string const& line : recentGuildHistory)
+                    user << line << "\n";
+                user << "\n";
+            }
+
+            if (conversation.empty())
+            {
+                user << "Start one short, natural guild-chat line as " << turn.botName
+                    << ". This is an idle social moment, not a response to a hidden player message. "
+                    << "If nothing suitable comes to mind, output exactly [SKIP].";
+            }
+            else
+            {
+                user << "Guild conversation so far:\n" << conversation
+                    << "\n\nAdd one short natural guild-chat reply as " << turn.botName
+                    << ". React only to what was actually said. If you truly have nothing to add, output exactly [SKIP].";
+            }
+
+            NpcChat_LLMResult res = NpcChat_CallBackgroundLLM(
+                BuildChatApiConfig(), system, user.str(), "guild-ambient");
+            std::string line = TrimCopy(res.text);
+            if (!res.success || line.empty() || ToLowerCopy(line) == "[skip]")
+                continue;
+
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                AppendHistoryLine(historyPath, turn.botName + ": " + line);
+            }
+            recentGuildHistory.push_back(turn.botName + ": " + line);
+            while (static_cast<int>(recentGuildHistory.size()) > req.historyTail && !recentGuildHistory.empty())
+                recentGuildHistory.pop_front();
+
+            if (!conversation.empty())
+                conversation += "\n";
+            conversation += turn.botName + ": " + line;
+
+            BotSocialReply reply;
+            reply.botGuidRaw = turn.botGuidRaw;
+            reply.channel = BotSocialChannel::Guild;
+            reply.text = std::move(line);
+            std::lock_guard<std::mutex> lock(BotSocialReplyMutex());
+            BotSocialReplyQueue().push(std::move(reply));
+        }
+    }
+
+    inline void MaybeStartGuildAmbientChat(Player* realPlayer)
+    {
+        if (!IsRealPlayerSession(realPlayer))
+            return;
+
+        GuildAmbientCfg const cfg = GetGuildAmbientCfg();
+        if (!cfg.enable)
+            return;
+
+        uint32 const guildId = realPlayer->GetGuildId();
+        Guild* guild = realPlayer->GetGuild();
+        if (!guildId || !guild)
+            return;
+
+        time_t const now = std::time(nullptr);
+        time_t& nextAt = GuildAmbientNextAt()[guildId];
+        if (nextAt == 0)
+        {
+            nextAt = now + GuildAmbientDelay(cfg);
+            return; // never chatter immediately just because a player logged in
+        }
+        if (now < nextAt)
+            return;
+
+        // Schedule the next attempt before doing any work so multiple real members updating on
+        // the same world tick cannot multiply the ambient rate for one guild.
+        nextAt = now + GuildAmbientDelay(cfg);
+
+        std::vector<Player*> candidates;
+        auto collectOnlineBot = [&](Player* member)
+        {
+            if (member && member != realPlayer && IsGenuineBot(member) && member->GetGuildId() == guildId)
+                candidates.push_back(member);
+        };
+        guild->BroadcastWorker(collectOnlineBot, realPlayer);
+        if (candidates.empty())
+            return;
+
+        std::vector<Player*> chosen = ChooseSocialBots(
+            candidates, "", cfg.maxSpeakers, cfg.randomBotChancePct);
+        if (chosen.empty())
+            return;
+
+        BotGuildAmbientConversationRequest req;
+        req.guildId = guildId;
+        req.historyTail = cfg.historyTail;
+        for (Player* bot : chosen)
+        {
+            if (!bot || !IsGenuineBot(bot))
+                continue;
+            BotChatRequest turn;
+            turn.botGuidRaw = bot->GetGUID().GetRawValue();
+            turn.botName = bot->GetName();
+            turn.botLevel = bot->GetLevel();
+            turn.botGender = BotGenderName(bot->getGender());
+            turn.botRace = BotRaceName(bot->getRace());
+            turn.botClass = BotClassName(bot->getClass());
+            req.turns.push_back(std::move(turn));
+        }
+        if (!req.turns.empty())
+            std::thread(BotGuildAmbientConversationWorker, std::move(req)).detach();
     }
 
     inline void DispatchBotSocialConversation(Player* player, std::vector<Player*> const& bots,
@@ -5832,6 +6086,7 @@ namespace
         if (!IsRealPlayerSession(player)) return false;   // only real senders
         if (!IsGenuineBot(receiver)) return false;         // only bot receivers
         if (text.empty() || text[0] == '.') return false;
+        if (IsBotRpBlacklisted(text, cfg.blacklist)) return true;
         DispatchBot(player, receiver, BotChannel::Whisper, text);
         return true;
     }
@@ -5845,6 +6100,7 @@ namespace
         if (!cfg.enable || !cfg.replyPartyRaid || !group) return;
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
+        if (IsBotRpBlacklisted(text, cfg.blacklist)) return;
 
         BotSocialChannel socialChannel;
         BotChannel legacyChannel;
@@ -5901,6 +6157,7 @@ namespace
         if (!IsRealPlayerSession(player) || !IsGenuineBot(bot)) return false;
         if (!bot->IsAlive() || !player->IsWithinDist(bot, cfg.triggerRange, true)) return false;
         if (text.empty() || text[0] == '.') return false;
+        if (IsBotRpBlacklisted(text, cfg.blacklist)) return true;
         DispatchBot(player, bot, BotChannel::Say, text);
         return true;
     }
@@ -6317,11 +6574,12 @@ namespace
                 }
                 else // ChannelMsg
                 {
-                    // Channel::Say needs the bot to be a channel member and Channel::IsOn is
-                    // private in this core, so we can't gate it. Whisper the requester instead:
-                    // reliable, and the natural LFG UX (the recruiter is told directly).
-                    if (player)
-                        bot->Whisper(r.text, LANG_UNIVERSAL, player);
+                    // A playerbot only whispers when the real player whispered it first. Channel/LFG
+                    // replies therefore stay in the originating channel instead of falling back to a DM.
+                    // GetChannel(..., pkt=false) quietly returns null when the bot is not a member.
+                    if (ChannelMgr* channelMgr = ChannelMgr::forTeam(bot->GetTeamId()))
+                        if (Channel* channel = channelMgr->GetChannel(r.channelName, bot, false))
+                            channel->Say(bot->GetGUID(), r.text, LANG_UNIVERSAL);
                 }
             }
             local.pop();
@@ -6331,9 +6589,11 @@ namespace
     // --- Guild surface: controlled multi-bot social conversation ----------------
     inline void HandleBotGuild(Player* player, uint32 /*type*/, Guild* guild, std::string const& text)
     {
-        if (!GetBotCfg().enable || !GetSurfaceCfg().guildEnable || !guild) return;
+        BotCfg const botCfg = GetBotCfg();
+        if (!botCfg.enable || !GetSurfaceCfg().guildEnable || !guild) return;
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
+        if (IsBotRpBlacklisted(text, botCfg.blacklist)) return;
 
         BotSurfaceCfg const cfg = GetSurfaceCfg();
         BotSocialCfg const social = GetBotSocialCfg();
@@ -6383,9 +6643,11 @@ namespace
     // --- Channel surface: General/Trade, LFG matchmaking + optional ambient ----
     inline void HandleBotChannel(Player* player, uint32 /*type*/, Channel* channel, std::string const& text)
     {
-        if (!GetBotCfg().enable || !channel) return;
+        BotCfg const botCfg = GetBotCfg();
+        if (!botCfg.enable || !channel) return;
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
+        if (IsBotRpBlacklisted(text, botCfg.blacklist)) return;
 
         BotSurfaceCfg const cfg = GetSurfaceCfg();
         std::string const chName = channel->GetName();   // e.g. "General - Elwynn Forest"
@@ -6541,31 +6803,48 @@ public:
             PLAYERHOOK_ON_LOGOUT
         }) {}
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg) override
+    static bool IsAddonTraffic(uint32 lang)
     {
+        return lang == static_cast<uint32>(LANG_ADDON);
+    }
+
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg) override
+    {
+        if (IsAddonTraffic(lang))
+            return true;
         return HandleNpcChat(player, type, msg);
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Player* receiver) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Player* receiver) override
     {
+        // WoW addons commonly use whisper transport with LANG_ADDON. Let the addon packet
+        // continue through AzerothCore, but never reinterpret it as player -> bot RP dialogue.
+        if (IsAddonTraffic(lang))
+            return true;
         HandleBotWhisper(player, type, receiver, TrimCopy(msg));
         return HandleNpcChat(player, type, msg);
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Group* group) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Group* group) override
     {
+        if (IsAddonTraffic(lang))
+            return true;
         HandleBotGroup(player, type, group, TrimCopy(msg));
         return HandleNpcChat(player, type, msg);
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Guild* guild) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Guild* guild) override
     {
+        if (IsAddonTraffic(lang))
+            return true;
         HandleBotGuild(player, type, guild, TrimCopy(msg));
         return true;
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Channel* channel) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Channel* channel) override
     {
+        if (IsAddonTraffic(lang))
+            return true;
         HandleBotChannel(player, type, channel, TrimCopy(msg));
         return true;
     }
@@ -6582,6 +6861,7 @@ public:
         // Guild presence is independent of whether the real player is currently
         // alive; dying/ghosting should not make their guild roster disappear.
         EnsureGuildBotsOnline(player);
+        MaybeStartGuildAmbientChat(player);
 
         if (!player->IsAlive())
             return;
