@@ -1974,7 +1974,14 @@ namespace
                 if (std::filesystem::file_size(item.path(), ec) == 0 || ec)
                     continue;
 
-                TouchNpcContact(playerGuid, npcEntry, folder.substr(0, playerSep), stem.substr(0, npcSep));
+                // Backfill only missing rows. Do not refresh last_talked_at on every restart;
+                // live conversations are the only thing that should move a contact to the front.
+                std::ostringstream sql;
+                sql << "INSERT IGNORE INTO `npcchat_contact` (`player_guid`,`npc_entry`,`player_name`,`npc_name`) VALUES ("
+                    << playerGuid << "," << npcEntry << ",'"
+                    << SqlEscape(folder.substr(0, playerSep)) << "','"
+                    << SqlEscape(stem.substr(0, npcSep)) << "')";
+                WorldDatabase.Execute(sql.str().c_str());
                 ++imported;
             }
         }
