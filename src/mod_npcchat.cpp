@@ -5204,6 +5204,13 @@ namespace
     // --- config (NpcChat.Bot.*) ------------------------------------------------
     // Read these values when a conversation is dispatched so `.npcc reload` applies
     // immediately. Character cards themselves are always read fresh from disk.
+    inline std::string const& DefaultBotRpBlacklist()
+    {
+        static std::string const value =
+            "t ,c ,r ,items,autogear,talents,reset botAI,summon,los,release,revive,leave,attack,follow,flee,stay,runaway,grind,disperse,give leader,spells,cast ,quests,accept,drop,talk,reset,ss ,trainer,rti,rtsc,do ,ll ,e ,ue ,nc ,open,destroy,s ,b ,bank,gb ,u ,co ,ELVUI_VERSIONCHK,Asked,DPSMate_,LibGroupTalents,BLT,oRA3,Skada,HealBot,hbComms,questie,pfQuest,DBMv4-Ver,BWVQ3,add,remove,reset ai,report,state,help,log,stats,tank,offtank,healer,cc ,damage,boost,passive,defensive,aggressive,stay,guard,free,follow,assist,pet,stance,formation,rpg,emote,cheer,applaud,drink,eat,dance,attackers,reset instances,home,zone,who ,who,pos ,tele,grind,loot,quest,trainer,travel,teleport,homebind,unfollow,invite,uninvite,join,leave,leader,ready,release,save,update,reset talents,gear,trade,mail,ah ,ahscan,ahbid,ahbuy,ahsell,ahcancel,bag,repair,vendor,train,spells,reset spells,learn,unlearn,cast,uncast,use ,move,go ,look,stop,turn,face,wait,party,followleader,stayleader,moveleader,info,distance,debug,reset path,reset state,reset all,reset dungeon,reset raid,zone info,LHC40,RECOUNT,GTFO_v,Altoholic,DS_,Crb,Crb ,maintenance ,DataStore";
+        return value;
+    }
+
     struct BotCfg
     {
         bool        enable = false;
@@ -5213,6 +5220,7 @@ namespace
         float       triggerRange = 25.0f;
         int         historyTail = 20;
         std::string characterCardsPath = "./characters";
+        std::string blacklist = DefaultBotRpBlacklist();
     };
 
     inline BotCfg GetBotCfg()
@@ -5226,7 +5234,44 @@ namespace
         cfg.historyTail = sConfigMgr->GetOption<int32>("NpcChat.Bot.HistoryMaxLines", 20, false);
         cfg.characterCardsPath = sConfigMgr->GetOption<std::string>(
             "NpcChat.Bot.CharacterCardsPath", "./characters", false);
+        cfg.blacklist = sConfigMgr->GetOption<std::string>(
+            "NpcChat.Bot.Blacklist", DefaultBotRpBlacklist(), false);
         return cfg;
+    }
+
+    // PBC-compatible prefix blacklist. Leading formatting whitespace after a comma is ignored,
+    // but trailing literal spaces are preserved because `t ` and `t` intentionally mean
+    // different things in the Playerbots command vocabulary. Matching is case-insensitive.
+    inline bool IsBotRpBlacklisted(std::string const& text, std::string const& rawBlacklist)
+    {
+        if (text.empty() || rawBlacklist.empty())
+            return false;
+
+        std::string const hay = ToLowerCopy(text);
+        size_t start = 0;
+        while (start <= rawBlacklist.size())
+        {
+            size_t end = rawBlacklist.find(',', start);
+            std::string prefix = rawBlacklist.substr(
+                start, end == std::string::npos ? std::string::npos : end - start);
+
+            while (!prefix.empty() && (prefix.front() == ' ' || prefix.front() == '\t'))
+                prefix.erase(prefix.begin());
+            while (!prefix.empty() && (prefix.back() == '\r' || prefix.back() == '\n' || prefix.back() == '\t'))
+                prefix.pop_back();
+
+            if (!prefix.empty())
+            {
+                std::string const needle = ToLowerCopy(prefix);
+                if (hay.rfind(needle, 0) == 0)
+                    return true;
+            }
+
+            if (end == std::string::npos)
+                break;
+            start = end + 1;
+        }
+        return false;
     }
 
 
@@ -6040,6 +6085,7 @@ namespace
         if (!IsRealPlayerSession(player)) return false;   // only real senders
         if (!IsGenuineBot(receiver)) return false;         // only bot receivers
         if (text.empty() || text[0] == '.') return false;
+        if (IsBotRpBlacklisted(text, cfg.blacklist)) return true;
         DispatchBot(player, receiver, BotChannel::Whisper, text);
         return true;
     }
@@ -6053,6 +6099,7 @@ namespace
         if (!cfg.enable || !cfg.replyPartyRaid || !group) return;
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
+        if (IsBotRpBlacklisted(text, cfg.blacklist)) return;
 
         BotSocialChannel socialChannel;
         BotChannel legacyChannel;
@@ -6109,6 +6156,7 @@ namespace
         if (!IsRealPlayerSession(player) || !IsGenuineBot(bot)) return false;
         if (!bot->IsAlive() || !player->IsWithinDist(bot, cfg.triggerRange, true)) return false;
         if (text.empty() || text[0] == '.') return false;
+        if (IsBotRpBlacklisted(text, cfg.blacklist)) return true;
         DispatchBot(player, bot, BotChannel::Say, text);
         return true;
     }
@@ -6539,9 +6587,11 @@ namespace
     // --- Guild surface: controlled multi-bot social conversation ----------------
     inline void HandleBotGuild(Player* player, uint32 /*type*/, Guild* guild, std::string const& text)
     {
-        if (!GetBotCfg().enable || !GetSurfaceCfg().guildEnable || !guild) return;
+        BotCfg const botCfg = GetBotCfg();
+        if (!botCfg.enable || !GetSurfaceCfg().guildEnable || !guild) return;
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
+        if (IsBotRpBlacklisted(text, botCfg.blacklist)) return;
 
         BotSurfaceCfg const cfg = GetSurfaceCfg();
         BotSocialCfg const social = GetBotSocialCfg();
@@ -6591,9 +6641,11 @@ namespace
     // --- Channel surface: General/Trade, LFG matchmaking + optional ambient ----
     inline void HandleBotChannel(Player* player, uint32 /*type*/, Channel* channel, std::string const& text)
     {
-        if (!GetBotCfg().enable || !channel) return;
+        BotCfg const botCfg = GetBotCfg();
+        if (!botCfg.enable || !channel) return;
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
+        if (IsBotRpBlacklisted(text, botCfg.blacklist)) return;
 
         BotSurfaceCfg const cfg = GetSurfaceCfg();
         std::string const chName = channel->GetName();   // e.g. "General - Elwynn Forest"
