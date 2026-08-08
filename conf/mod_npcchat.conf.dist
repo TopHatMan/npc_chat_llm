@@ -82,6 +82,21 @@ NpcChat.RelationshipBarks.ScanIntervalMs = 2000
 NpcChat.RelationshipBarks.GenerateMissing = 0
 
 ###################################################################################################
+# HISTORY-AWARE NPC WHISPERS
+#
+# Once a real player has actually talked to an NPC, the module records a lightweight contact index.
+# When that NPC is nearby later, it may use the existing personal chat history to privately whisper
+# a short recognition/follow-up line. This is a normal LLM call, so chance and cooldowns are conservative.
+###################################################################################################
+NpcChat.HistoryWhispers.Enabled = 1
+NpcChat.HistoryWhispers.TriggerDistance = 18.0
+NpcChat.HistoryWhispers.ChancePct = 12
+NpcChat.HistoryWhispers.PlayerCooldownSec = 300
+NpcChat.HistoryWhispers.PairCooldownSec = 900
+NpcChat.HistoryWhispers.ScanIntervalMs = 5000
+NpcChat.HistoryWhispers.HistoryMaxLines = 8
+
+###################################################################################################
 # Cached hostile elite first-talk barks
 # Uses shared .hostile_barks files.
 # Safe first version checks selected hostile NPC only, not full nearby grid scan.
@@ -272,9 +287,26 @@ NpcChat.Bot.TriggerRange = 25.0
 # Recent lines of (player+bot) history fed back to the model. Main cost dial. Default: 20
 NpcChat.Bot.HistoryMaxLines = 20
 
+###################################################################################################
+# PLAYERBOT SOCIAL CHAT
+#
+# A real player's party/raid/guild message may start one bounded social conversation. Named bots
+# always count as an explicit invitation. Otherwise chance + cooldown decide whether chatter starts.
+# Non-random/alt bots are preferred; random playerbots can occasionally join so large raids feel alive.
+###################################################################################################
+NpcChat.Bot.Social.Enable = 1
+NpcChat.Bot.Social.PartyChancePct = 70
+NpcChat.Bot.Social.RaidChancePct = 35
+NpcChat.Bot.Social.GuildChancePct = 55
+NpcChat.Bot.Social.PartyMaxSpeakers = 3
+NpcChat.Bot.Social.RaidMaxSpeakers = 2
+NpcChat.Bot.Social.GuildMaxSpeakers = 3
+NpcChat.Bot.Social.RandomBotChancePct = 25
+NpcChat.Bot.Social.CooldownSec = 20
+
 
 ###################################################################################################
-# PLAYERBOT LFG  -  "LFM heals" in General finds a matching nearby bot who answers (via whisper)
+# PLAYERBOT LFG
 ###################################################################################################
 
 # Master switch for LFG matchmaking. Default: 1
