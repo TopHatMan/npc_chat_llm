@@ -99,13 +99,14 @@ NpcChat.RelationshipBarks.GenerateMissing = 0
 
 ###################################################################################################
 # History-aware familiar NPC whispers
+# Kept intentionally light so familiar NPCs feel alive without constantly whispering the player.
 ###################################################################################################
 NpcChat.HistoryWhispers.Enabled = 1
 NpcChat.HistoryWhispers.TriggerDistance = 18.0
-NpcChat.HistoryWhispers.ChancePct = 12
-NpcChat.HistoryWhispers.PlayerCooldownSec = 300
-NpcChat.HistoryWhispers.PairCooldownSec = 900
-NpcChat.HistoryWhispers.ScanIntervalMs = 5000
+NpcChat.HistoryWhispers.ChancePct = 5
+NpcChat.HistoryWhispers.PlayerCooldownSec = 600
+NpcChat.HistoryWhispers.PairCooldownSec = 1800
+NpcChat.HistoryWhispers.ScanIntervalMs = 8000
 NpcChat.HistoryWhispers.HistoryMaxLines = 8
 
 ###################################################################################################
@@ -183,6 +184,17 @@ NpcChat.Bot.GuildPresence.Enable = 1
 NpcChat.Bot.GuildPresence.ScanIntervalSec = 10
 NpcChat.Bot.GuildPresence.MaxLoginsPerScan = 20
 NpcChat.Bot.GuildPresence.IncludeAddClass = 1
+
+###################################################################################################
+# Autonomous low-frequency guild chatter while a real guild member is online
+# This is direct guild broadcast, so generated lines do not recurse through chat hooks.
+###################################################################################################
+NpcChat.Bot.GuildAmbient.Enable = 1
+NpcChat.Bot.GuildAmbient.MinIntervalSec = 90
+NpcChat.Bot.GuildAmbient.MaxIntervalSec = 240
+NpcChat.Bot.GuildAmbient.MaxSpeakers = 2
+NpcChat.Bot.GuildAmbient.RandomBotChancePct = 15
+NpcChat.Bot.GuildAmbient.HistoryMaxLines = 12
 
 ###################################################################################################
 # Playerbot LFG / General
