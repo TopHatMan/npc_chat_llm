@@ -1,0 +1,38 @@
+name: Apply party/history repair patch
+
+on:
+  push:
+    branches:
+      - agent/fix-party-and-scrub-bot-history
+    paths:
+      - scripts/_apply_party_history_fix.py
+      - .github/workflows/_apply-party-history-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-party-and-scrub-bot-history
+      - name: Apply repair patch
+        run: python3 scripts/_apply_party_history_fix.py
+      - name: Validate config contract and invariants
+        run: |
+          python3 scripts/validate_config_contract.py
+          grep -q 'NpcChat.Bot.Social.PartyChancePct = 100' conf/mod_npcchat.conf.dist
+          grep -q 'NpcChat.Bot.Social.PartyCooldownSec = 4' conf/mod_npcchat.conf.dist
+          grep -q 'ScrubAndLoadBotHistoryTail' src/mod_npcchat.cpp
+          grep -q 'first selected party companion' src/mod_npcchat.cpp
+          grep -q '.npcc bot history scrub' src/mod_npcchat.cpp
+          git diff --check
+      - name: Commit generated repair
+        run: |
+          git config user.name "Nick"
+          git config user.email "36683809+TopHatMan@users.noreply.github.com"
+          git add src/mod_npcchat.cpp conf/mod_npcchat.conf.dist PLAYERBOT_CHAT.md
+          git commit -m "Repair party chat and scrub polluted bot history"
+          git push origin agent/fix-party-and-scrub-bot-history
