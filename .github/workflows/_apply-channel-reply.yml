@@ -1,0 +1,58 @@
+name: Apply channel reply routing patch
+
+on:
+  push:
+    branches:
+      - agent/tune-whispers-and-guild-chatter
+    paths:
+      - scripts/_apply_channel_reply_patch.py
+      - .github/workflows/_apply-channel-reply.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/tune-whispers-and-guild-chatter
+          fetch-depth: 0
+
+      - name: Apply channel routing patch
+        run: python scripts/_apply_channel_reply_patch.py
+
+      - name: Validate whisper initiation rule
+        run: |
+          python scripts/validate_config_contract.py
+          python - <<'PY'
+          from pathlib import Path
+          cpp = Path('src/mod_npcchat.cpp').read_text()
+          checks = {
+              'ChannelMgr included': '#include "ChannelMgr.h"' in cpp,
+              'channel emits through Channel::Say': 'channel->Say(bot->GetGUID(), r.text, LANG_UNIVERSAL);' in cpp,
+              'channel fallback DM removed': 'Whisper the requester instead' not in cpp,
+              'direct whisper reply remains': 'case BotChannel::Whisper:' in cpp and 'bot->Whisper(r.text, LANG_UNIVERSAL, player);' in cpp,
+              'addon hard filter remains': 'static_cast<uint32>(LANG_ADDON)' in cpp,
+              'blacklist remains': 'NpcChat.Bot.Blacklist' in cpp,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          for name, ok in checks.items():
+              print(('OK   ' if ok else 'FAIL ') + name)
+          if failed:
+              raise SystemExit('failed whisper/channel invariants: ' + ', '.join(failed))
+          PY
+          git diff --check
+
+      - name: Commit source patch
+        run: |
+          git config user.name "TopHatMan"
+          git config user.email "36683809+TopHatMan@users.noreply.github.com"
+          git add src/mod_npcchat.cpp
+          if git diff --cached --quiet; then
+            echo "No source changes"
+            exit 0
+          fi
+          git commit -m "Keep bot channel replies out of whispers"
+          git push origin HEAD:agent/tune-whispers-and-guild-chatter
