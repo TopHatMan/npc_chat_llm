@@ -1,0 +1,60 @@
+name: Apply NPC Chat stabilization patch
+
+on:
+  push:
+    branches:
+      - agent/stabilize-npcchat-runtime
+    paths:
+      - scripts/_apply_stabilization_patch.py
+      - .github/workflows/_apply-stabilization.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/stabilize-npcchat-runtime
+          fetch-depth: 0
+
+      - name: Apply stabilization patch
+        run: python scripts/_apply_stabilization_patch.py
+
+      - name: Validate generated diff
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          conf = Path('conf/mod_npcchat.conf.dist').read_text()
+          keys = []
+          for line in conf.splitlines():
+              m = re.match(r'^\s*(NpcChat\.[A-Za-z0-9_.]+)\s*=', line)
+              if m: keys.append(m.group(1))
+          dup = sorted({k for k in keys if keys.count(k) > 1})
+          if dup:
+              raise SystemExit('duplicate config keys: ' + ', '.join(dup))
+          cpp = Path('src/mod_npcchat.cpp').read_text()
+          llm = Path('src/npcchat_llm.cpp').read_text()
+          assert '.npcc health [test|reset]' in cpp
+          assert 'NpcChat.Api.ReserveInteractiveSlots' in cpp
+          assert 'NpcChat_CallBackgroundLLM' in cpp
+          assert 'NpcChat_CallGenerationLLM' in cpp
+          assert '++_failed;\n            ++_rejectedCapacity;' not in llm
+          print('generated stabilization validation OK')
+          PY
+          git diff --check
+
+      - name: Commit generated stabilization changes
+        run: |
+          git config user.name "TopHatMan"
+          git config user.email "36683809+TopHatMan@users.noreply.github.com"
+          git add src/mod_npcchat.cpp src/npcchat_llm.cpp src/npcchat_llm.h conf/mod_npcchat.conf.dist README.md
+          if git diff --cached --quiet; then
+            echo "No generated changes"
+            exit 0
+          fi
+          git commit -m "Stabilize NPC Chat transport and diagnostics"
+          git push origin HEAD:agent/stabilize-npcchat-runtime
