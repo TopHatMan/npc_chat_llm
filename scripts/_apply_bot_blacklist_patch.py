@@ -25,7 +25,6 @@ blacklist = (
     "LHC40,RECOUNT,GTFO_v,Altoholic,DS_,DataStore,Crb,Crb ,maintenance "
 )
 
-# Add a default so older deployed configs immediately get protection even before the new key is copied over.
 cpp = replace_once(
     cpp,
     '''    struct BotCfg\n    {\n        bool        enable = false;\n        bool        replyWhisper = true;\n        bool        replyPartyRaid = true;\n        bool        replyTarget = true;\n        float       triggerRange = 25.0f;\n        int         historyTail = 20;\n        std::string characterCardsPath = "./characters";\n    };\n''',
@@ -40,8 +39,6 @@ cpp = replace_once(
     "GetBotCfg blacklist load",
 )
 
-# Apply before every playerbot RP surface. For target /say, return true so HandleNpcChat stops and
-# does not accidentally let a nearby world NPC answer a bot-control command.
 cpp = replace_once(
     cpp,
     '''        if (!IsGenuineBot(receiver)) return false;         // only bot receivers\n        if (text.empty() || text[0] == '.') return false;\n        DispatchBot(player, receiver, BotChannel::Whisper, text);\n''',
@@ -63,16 +60,12 @@ cpp = replace_once(
     "target say blacklist",
 )
 
-# Guild currently starts by loading both BotCfg and surface/social config.
-guild_anchor = '''        BotCfg const botCfg = GetBotCfg();\n        if (!botCfg.enable || !guild) return;\n        if (!IsRealPlayerSession(player)) return;\n        if (text.empty() || text[0] == '.') return;\n'''
-if guild_anchor in cpp:
-    cpp = cpp.replace(guild_anchor, guild_anchor + '''        if (IsBotRpBlacklisted(text, botCfg.blacklist)) return;\n''', 1)
-else:
-    # Accept the alternate current shape if the function uses GetBotCfg inline.
-    alt = '''        if (!GetBotCfg().enable || !guild) return;\n        if (!IsRealPlayerSession(player)) return;\n        if (text.empty() || text[0] == '.') return;\n'''
-    if alt not in cpp:
-        raise SystemExit("guild blacklist anchor not found")
-    cpp = cpp.replace(alt, '''        BotCfg const botCfg = GetBotCfg();\n        if (!botCfg.enable || !guild) return;\n        if (!IsRealPlayerSession(player)) return;\n        if (text.empty() || text[0] == '.') return;\n        if (IsBotRpBlacklisted(text, botCfg.blacklist)) return;\n''', 1)
+cpp = replace_once(
+    cpp,
+    '''        if (!GetBotCfg().enable || !GetSurfaceCfg().guildEnable || !guild) return;\n        if (!IsRealPlayerSession(player)) return;\n        if (text.empty() || text[0] == '.') return;\n\n        BotSurfaceCfg const cfg = GetSurfaceCfg();\n''',
+    '''        BotCfg const botCfg = GetBotCfg();\n        if (!botCfg.enable || !GetSurfaceCfg().guildEnable || !guild) return;\n        if (!IsRealPlayerSession(player)) return;\n        if (text.empty() || text[0] == '.') return;\n        if (IsBotRpBlacklisted(text, botCfg.blacklist)) return;\n\n        BotSurfaceCfg const cfg = GetSurfaceCfg();\n''',
+    "guild blacklist",
+)
 
 cpp = replace_once(
     cpp,
@@ -83,7 +76,6 @@ cpp = replace_once(
 
 cpp_path.write_text(cpp)
 
-# Canonical config key. Keep the user's exact PBC-derived list so deployments can edit it in one place.
 conf_path = Path("conf/mod_npcchat.conf.dist")
 conf = conf_path.read_text()
 anchor = '''NpcChat.Bot.HistoryMaxLines = 20\n'''
