@@ -305,6 +305,29 @@ NpcChat.Bot.Social.RandomBotChancePct = 25
 NpcChat.Bot.Social.CooldownSec = 20
 
 
+
+###################################################################################################
+# PLAYERBOT GUILD PRESENCE - keep guild bots online while a real guild member is online
+#
+# This is deliberately stricter than "every offline guild character": only characters belonging
+# to configured Playerbots random-bot accounts (plus optional addclass bots) are eligible. Normal
+# human alts in the guild are ignored.
+###################################################################################################
+
+# Master switch. Default: 1
+NpcChat.Bot.GuildPresence.Enable = 1
+
+# Per-guild rescan interval while at least one real guild member is online. Default: 10 seconds.
+NpcChat.Bot.GuildPresence.ScanIntervalSec = 10
+
+# Maximum offline guild bots requested per scan. Repeated scans continue until all eligible bots
+# are online. 0 = unlimited; a finite value avoids a login storm in very large guilds. Default: 20.
+NpcChat.Bot.GuildPresence.MaxLoginsPerScan = 20
+
+# Also allow Playerbots addclass characters to be treated as guild bots. Default: 1
+NpcChat.Bot.GuildPresence.IncludeAddClass = 1
+
+
 ###################################################################################################
 # PLAYERBOT LFG
 ###################################################################################################

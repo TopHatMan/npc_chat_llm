@@ -114,6 +114,24 @@ NpcChat.Bot.Social.CooldownSec = 20
 
 Named bot messages bypass the ambient chance roll. Ambient conversations use the chance and cooldown settings.
 
+
+## Keeping guild bots online
+
+`NpcChat.Bot.GuildPresence.Enable = 1` makes guild presence follow the **real players** in that guild. While at least one real guild member is online, `npc_chat_llm` periodically scans the guild roster and asks Playerbots to log in eligible offline guild bots.
+
+This does **not** mean "log in every offline character in the guild." The module checks the character's account against Playerbots' configured random-bot account list, and can optionally include Playerbots addclass characters. Ordinary human alts are ignored.
+
+```ini
+NpcChat.Bot.GuildPresence.Enable = 1
+NpcChat.Bot.GuildPresence.ScanIntervalSec = 10
+NpcChat.Bot.GuildPresence.MaxLoginsPerScan = 20
+NpcChat.Bot.GuildPresence.IncludeAddClass = 1
+```
+
+The login is routed through `RandomPlayerbotMgr` with no real-player master account, so these characters remain autonomous guild members rather than becoming followers of the player who happened to trigger the scan. A per-guild cooldown prevents the player update hook from querying the roster every frame, and the login cap spreads very large guilds across multiple scans.
+
+The module does **not** force guild bots to log out when the last real guild member leaves. Playerbots keeps ownership of the normal bot lifecycle. If Playerbots later logs one of these bots out while a real guild member is still online, a later guild-presence scan can request it again.
+
 ## Quick test checklist
 
 1. Move or rename any existing card for a test bot so no `characters/<BotName>.card.txt` exists.
@@ -123,6 +141,8 @@ Named bot messages bypass the ambient chance roll. Ambient conversations use the
 5. Talk to the bot again and confirm the next reply reflects the edit without restarting or reloading.
 6. Put several playerbots in a party and send a normal party message; confirm only a bounded set replies.
 7. Repeat in raid chat and confirm the raid speaker cap is respected.
-8. Send a guild message with several online guild bots and confirm a small multi-bot conversation can occur.
-9. Name one specific bot and confirm it is favored as a speaker.
-10. Confirm recent bot history remains under `NpcChat.HistoryPath/bots/personal/` and no GUID-based `.card` files are created.
+8. Log in a real guild member with several eligible guild bots offline; within the configured scans, confirm those bot characters appear online in the guild roster.
+9. Confirm an ordinary non-bot alt in the same guild remains offline.
+10. Send a guild message after the bots have logged in and confirm a small multi-bot conversation can occur.
+11. Name one specific bot and confirm it is favored as a speaker.
+12. Confirm recent bot history remains under `NpcChat.HistoryPath/bots/personal/` and no GUID-based `.card` files are created.
