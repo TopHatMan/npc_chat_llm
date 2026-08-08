@@ -118,13 +118,14 @@ Default settings:
 
 ```ini
 NpcChat.Bot.Social.Enable = 1
-NpcChat.Bot.Social.PartyChancePct = 70
+NpcChat.Bot.Social.PartyChancePct = 100
 NpcChat.Bot.Social.RaidChancePct = 35
 NpcChat.Bot.Social.GuildChancePct = 55
 NpcChat.Bot.Social.PartyMaxSpeakers = 3
 NpcChat.Bot.Social.RaidMaxSpeakers = 2
 NpcChat.Bot.Social.GuildMaxSpeakers = 3
 NpcChat.Bot.Social.RandomBotChancePct = 25
+NpcChat.Bot.Social.PartyCooldownSec = 4
 NpcChat.Bot.Social.CooldownSec = 20
 ```
 
@@ -163,3 +164,21 @@ The module does **not** force guild bots to log out when the last real guild mem
 12. Send a guild message after the bots have logged in and confirm a small multi-bot conversation can occur.
 13. Name one specific bot and confirm it is favored as a speaker.
 14. Confirm recent bot history remains under `NpcChat.HistoryPath/bots/personal/` and no GUID-based `.card` files are created.
+
+## Repairing old addon/command history
+
+Older builds could accidentally save addon packets and Playerbots command text into personal bot RP history.
+Current builds hard-filter new traffic and also scrub each personal bot history file before loading it into an LLM prompt.
+If junk is found, the cleaned history is rewritten to disk automatically.
+
+To repair every existing personal bot history immediately:
+
+```text
+.npcc bot history scrub
+```
+
+The command recursively scans `NpcChat.HistoryPath/bots/personal/` and removes lines whose payload matches the configured `NpcChat.Bot.Blacklist`, known addon protocol identifiers, control-byte payloads, or obvious old AI commentary about leaked addon protocol traffic.
+
+## Party responsiveness
+
+Party chat is intentionally more responsive than raid/guild ambient chatter. By default a real player's eligible party message triggers the bot conversation path at 100%, uses a short 4-second party cooldown, and the first selected companion must produce a real reply instead of `[SKIP]`. Additional selected companions may still stay quiet. Bot-control/addon messages remain filtered before this logic.

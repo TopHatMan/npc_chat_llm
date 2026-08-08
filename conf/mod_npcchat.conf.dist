@@ -171,13 +171,15 @@ NpcChat.Bot.Blacklist = t ,c ,r ,items,autogear,talents,reset botAI,summon,los,r
 # Playerbot social party / raid / guild conversations
 ###################################################################################################
 NpcChat.Bot.Social.Enable = 1
-NpcChat.Bot.Social.PartyChancePct = 70
+NpcChat.Bot.Social.PartyChancePct = 100
 NpcChat.Bot.Social.RaidChancePct = 35
 NpcChat.Bot.Social.GuildChancePct = 55
 NpcChat.Bot.Social.PartyMaxSpeakers = 3
 NpcChat.Bot.Social.RaidMaxSpeakers = 2
 NpcChat.Bot.Social.GuildMaxSpeakers = 3
 NpcChat.Bot.Social.RandomBotChancePct = 25
+# Party is direct companion conversation, so it uses a short cooldown. CooldownSec remains raid/guild ambient throttle.
+NpcChat.Bot.Social.PartyCooldownSec = 4
 NpcChat.Bot.Social.CooldownSec = 20
 
 ###################################################################################################
