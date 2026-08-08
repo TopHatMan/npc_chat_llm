@@ -34,12 +34,12 @@ jobs:
 
           checks = {
               'direct NPC failure is visible': 'NPC Chat could not reply:' in cpp,
-              'health command exists': 'NpcChat API health test queued' in cpp,
+              'health command exists': 'NPC Chat API health test queued' in cpp,
               'background lane is wired': 'NpcChat_CallBackgroundLLM' in cpp,
               'generation lane is wired': 'NpcChat_CallGenerationLLM' in cpp,
               'direct interactive label exists': '"direct-npc"' in cpp,
               'no old SlotGuard': 'SlotGuard' not in llm,
-              'success releases slot': llm.count('Release(requestClass);') >= 2,
+              'transport releases slots': llm.count('Release(requestClass);') >= 2,
               'typed transport result': 'NpcChat_LLMError error' in hdr,
               'transport class exists': 'class NpcChatTransport' in hdr,
               'no silent non-200 return': 'res->status != 200)\n            return ""' not in llm,
@@ -52,5 +52,4 @@ jobs:
           PY
 
       - name: Diff hygiene
-        run: |
-          git diff --check origin/main...HEAD
+        run: git diff --check origin/main...HEAD
