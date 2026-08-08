@@ -22,7 +22,7 @@ blacklist = (
     "save,update,reset talents,gear,trade,mail,ah ,ahscan,ahbid,ahbuy,ahsell,ahcancel,bag,repair,vendor,train,"
     "spells,reset spells,learn,unlearn,cast,uncast,use ,move,go ,look,stop,turn,face,wait,party,followleader,"
     "stayleader,moveleader,info,distance,debug,reset path,reset state,reset all,reset dungeon,reset raid,zone info,"
-    "LHC40,RECOUNT,GTFO_v,Altoholic,DS_,DataStore,Crb,Crb ,maintenance "
+    "LHC40,RECOUNT,GTFO_v,Altoholic,DS_,Crb,Crb ,maintenance ,DataStore"
 )
 
 cpp = replace_once(
