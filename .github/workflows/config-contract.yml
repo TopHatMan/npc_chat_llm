@@ -1,0 +1,28 @@
+name: NPC Chat config contract
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'conf/mod_npcchat.conf.dist'
+      - 'scripts/validate_config_contract.py'
+      - '.github/workflows/config-contract.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'conf/mod_npcchat.conf.dist'
+      - 'scripts/validate_config_contract.py'
+      - '.github/workflows/config-contract.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate source/config contract
+        run: python scripts/validate_config_contract.py
