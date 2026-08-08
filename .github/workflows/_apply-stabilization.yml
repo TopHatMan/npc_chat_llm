@@ -1,4 +1,4 @@
-name: Tighten NPC Chat stabilization
+name: Final NPC Chat stabilization validation
 
 on:
   push:
@@ -8,10 +8,10 @@ on:
       - .github/workflows/_apply-stabilization.yml
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  patch:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,37 +19,38 @@ jobs:
           ref: agent/stabilize-npcchat-runtime
           fetch-depth: 0
 
-      - name: Replace local slot guard with explicit release
+      - name: Validate config contract
+        run: |
+          python -m py_compile scripts/validate_config_contract.py
+          python scripts/validate_config_contract.py
+
+      - name: Validate stabilization invariants
         run: |
           python - <<'PY'
           from pathlib import Path
-          p = Path('src/npcchat_llm.cpp')
-          s = p.read_text()
-          old = '''    struct SlotGuard\n    {\n        NpcChatTransport& transport;\n        NpcChat_RequestClass requestClass;\n        ~SlotGuard() { transport.Release(requestClass); }\n    } guard{ *this, requestClass };\n\n'''
-          if s.count(old) != 1:
-              raise SystemExit(f'expected one SlotGuard block, found {s.count(old)}')
-          s = s.replace(old, '', 1)
-          old_success = '''            result.httpStatus = http.status;\n            result.attempts = attempt;\n            RecordSuccess(requestClass);\n            return result;\n'''
-          new_success = '''            result.httpStatus = http.status;\n            result.attempts = attempt;\n            Release(requestClass);\n            RecordSuccess(requestClass);\n            return result;\n'''
-          if s.count(old_success) != 1:
-              raise SystemExit('success release anchor not found exactly once')
-          s = s.replace(old_success, new_success, 1)
-          old_failure = '''    if (lastFailure.error == NpcChat_LLMError::None)\n        lastFailure = MakeFailure(NpcChat_LLMError::Transport, "request failed without a diagnostic result");\n    RecordFailure(cfg, requestClass, label, lastFailure);\n    return lastFailure;\n'''
-          new_failure = '''    if (lastFailure.error == NpcChat_LLMError::None)\n        lastFailure = MakeFailure(NpcChat_LLMError::Transport, "request failed without a diagnostic result");\n    Release(requestClass);\n    RecordFailure(cfg, requestClass, label, lastFailure);\n    return lastFailure;\n'''
-          if s.count(old_failure) != 1:
-              raise SystemExit('failure release anchor not found exactly once')
-          s = s.replace(old_failure, new_failure, 1)
-          p.write_text(s)
+          cpp = Path('src/mod_npcchat.cpp').read_text()
+          llm = Path('src/npcchat_llm.cpp').read_text()
+          hdr = Path('src/npcchat_llm.h').read_text()
+
+          checks = {
+              'direct NPC failure is visible': 'NPC Chat could not reply:' in cpp,
+              'health command exists': 'NpcChat API health test queued' in cpp,
+              'background lane is wired': 'NpcChat_CallBackgroundLLM' in cpp,
+              'generation lane is wired': 'NpcChat_CallGenerationLLM' in cpp,
+              'direct interactive label exists': '"direct-npc"' in cpp,
+              'no old SlotGuard': 'SlotGuard' not in llm,
+              'success releases slot': llm.count('Release(requestClass);') >= 2,
+              'typed transport result': 'NpcChat_LLMError error' in hdr,
+              'transport class exists': 'class NpcChatTransport' in hdr,
+              'no silent non-200 return': 'res->status != 200)\n            return ""' not in llm,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          for name, ok in checks.items():
+              print(('OK   ' if ok else 'FAIL ') + name)
+          if failed:
+              raise SystemExit('failed stabilization invariants: ' + ', '.join(failed))
           PY
 
-      - name: Validate and commit
+      - name: Diff hygiene
         run: |
-          grep -q 'Release(requestClass);' src/npcchat_llm.cpp
-          if grep -q 'SlotGuard' src/npcchat_llm.cpp; then exit 1; fi
-          git diff --check
-          git config user.name "TopHatMan"
-          git config user.email "36683809+TopHatMan@users.noreply.github.com"
-          git add src/npcchat_llm.cpp
-          if git diff --cached --quiet; then exit 0; fi
-          git commit -m "Make transport slot release explicit"
-          git push origin HEAD:agent/stabilize-npcchat-runtime
+          git diff --check origin/main...HEAD
