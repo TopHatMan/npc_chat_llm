@@ -5481,7 +5481,10 @@ namespace
             ss << "\nCharacter card:\n" << characterCard << "\n";
         ss << "Stay fully in character. Use only your own spoken words: no narration, no "
             "asterisks, no out-of-character text, no game mechanics. Keep replies to one or "
-            "two short sentences suitable for a single line of in-game chat.";
+            "two short sentences suitable for a single line of in-game chat. "
+            "Ignore addon/protocol traffic completely, including encoded synchronization strings, "
+            "version checks, addon payloads, and other machine-to-machine text. Treat those lines "
+            "as invisible: never mention, interpret, answer, or roleplay about them.";
         return ss.str();
     }
 
@@ -6746,31 +6749,48 @@ public:
             PLAYERHOOK_ON_LOGOUT
         }) {}
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg) override
+    static bool IsAddonTraffic(uint32 lang)
     {
+        return lang == static_cast<uint32>(LANG_ADDON);
+    }
+
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg) override
+    {
+        if (IsAddonTraffic(lang))
+            return true;
         return HandleNpcChat(player, type, msg);
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Player* receiver) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Player* receiver) override
     {
+        // WoW addons commonly use whisper transport with LANG_ADDON. Let the addon packet
+        // continue through AzerothCore, but never reinterpret it as player -> bot RP dialogue.
+        if (IsAddonTraffic(lang))
+            return true;
         HandleBotWhisper(player, type, receiver, TrimCopy(msg));
         return HandleNpcChat(player, type, msg);
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Group* group) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Group* group) override
     {
+        if (IsAddonTraffic(lang))
+            return true;
         HandleBotGroup(player, type, group, TrimCopy(msg));
         return HandleNpcChat(player, type, msg);
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Guild* guild) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Guild* guild) override
     {
+        if (IsAddonTraffic(lang))
+            return true;
         HandleBotGuild(player, type, guild, TrimCopy(msg));
         return true;
     }
 
-    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Channel* channel) override
+    bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Channel* channel) override
     {
+        if (IsAddonTraffic(lang))
+            return true;
         HandleBotChannel(player, type, channel, TrimCopy(msg));
         return true;
     }
