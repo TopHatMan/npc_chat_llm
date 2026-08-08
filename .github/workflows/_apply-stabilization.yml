@@ -21,7 +21,13 @@ jobs:
           fetch-depth: 0
 
       - name: Apply stabilization patch
-        run: python scripts/_apply_stabilization_patch.py
+        run: |
+          python scripts/_apply_stabilization_patch.py
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('README.md')
+          p.write_text(p.read_text().rstrip() + '\n')
+          PY
 
       - name: Validate generated diff
         run: |
