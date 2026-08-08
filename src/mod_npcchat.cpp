@@ -5275,6 +5275,137 @@ namespace
         return false;
     }
 
+    struct BotHistoryScrubStats
+    {
+        size_t filesScanned = 0;
+        size_t linesRemoved = 0;
+    };
+
+    inline std::string BotHistoryPayload(std::string const& line)
+    {
+        size_t const colon = line.find(':');
+        if (colon == std::string::npos)
+            return TrimCopy(line);
+        return TrimCopy(line.substr(colon + 1));
+    }
+
+    inline bool LooksLikeAddonProtocolHistory(std::string const& text)
+    {
+        if (text.empty())
+            return false;
+
+        std::string const low = ToLowerCopy(text);
+        static char const* markers[] =
+        {
+            "elvui_versionchk", "dpsmate_", "libgrouptalents", "ora3", "skada",
+            "healbot", "hbcomms", "questie", "pfquest", "dbmv4-ver", "bwvq3",
+            "lhc40", "recount", "gtfo_v", "altoholic", "datastore", "ds_", "crb"
+        };
+        for (char const* marker : markers)
+            if (low.find(marker) != std::string::npos)
+                return true;
+
+        // Old model replies sometimes literally discussed the leaked packet. Those lines are just
+        // as poisonous to future RP as the original payload, so remove obvious protocol commentary.
+        bool const mentionsAddon = low.find("addon") != std::string::npos;
+        bool const mentionsProtocol = low.find("protocol") != std::string::npos ||
+            low.find("version check") != std::string::npos ||
+            low.find("sync message") != std::string::npos ||
+            low.find("synchronization") != std::string::npos;
+        if (mentionsAddon && mentionsProtocol)
+            return true;
+
+        for (unsigned char c : text)
+            if (c < 0x20 && c != '\t')
+                return true;
+        return false;
+    }
+
+    inline bool IsBotHistoryNoiseLine(std::string const& line, std::string const& blacklist)
+    {
+        std::string const payload = BotHistoryPayload(line);
+        return IsBotRpBlacklisted(payload, blacklist) || LooksLikeAddonProtocolHistory(payload);
+    }
+
+    // Caller holds g_FileMutex. The entire file is rewritten only when junk is found; the returned
+    // deque is still limited to the configured prompt tail. This permanently repairs contaminated
+    // histories lazily as each bot is spoken to.
+    inline std::deque<std::string> ScrubAndLoadBotHistoryTail(std::string const& path, int maxLines,
+        std::string const& blacklist, size_t* removedOut = nullptr)
+    {
+        std::ifstream f(path);
+        if (!f.is_open())
+        {
+            if (removedOut) *removedOut = 0;
+            return {};
+        }
+
+        std::vector<std::string> kept;
+        size_t removed = 0;
+        std::string line;
+        while (std::getline(f, line))
+        {
+            line = TrimCopy(line);
+            if (line.empty())
+                continue;
+            if (IsBotHistoryNoiseLine(line, blacklist))
+            {
+                ++removed;
+                continue;
+            }
+            kept.push_back(line);
+        }
+        f.close();
+
+        if (removed)
+        {
+            std::ostringstream clean;
+            for (std::string const& keptLine : kept)
+                clean << keptLine << "\n";
+            WriteWholeTextFile(path, TrimCopy(clean.str()), true);
+            LOG_INFO("module", "[NpcChat] Scrubbed {} addon/Playerbots command line(s) from bot RP history {}.",
+                removed, path);
+        }
+
+        if (removedOut)
+            *removedOut = removed;
+
+        std::deque<std::string> tail;
+        if (maxLines <= 0)
+            return tail;
+        size_t const start = kept.size() > static_cast<size_t>(maxLines) ?
+            kept.size() - static_cast<size_t>(maxLines) : 0;
+        for (size_t i = start; i < kept.size(); ++i)
+            tail.push_back(kept[i]);
+        return tail;
+    }
+
+    // Caller holds g_FileMutex. Used by `.npcc bot history scrub` for an immediate one-shot cleanup.
+    inline BotHistoryScrubStats ScrubAllBotPersonalHistory(std::string const& blacklist)
+    {
+        BotHistoryScrubStats stats;
+        std::filesystem::path const root = std::filesystem::path(g_HistoryPath) / "bots" / "personal";
+        try
+        {
+            if (!std::filesystem::exists(root))
+                return stats;
+            for (auto const& entry : std::filesystem::recursive_directory_iterator(root))
+            {
+                if (!entry.is_regular_file() || entry.path().extension() != ".history")
+                    continue;
+                ++stats.filesScanned;
+                size_t removed = 0;
+                (void)ScrubAndLoadBotHistoryTail(entry.path().string(), 0, blacklist, &removed);
+                stats.linesRemoved += removed;
+            }
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("module", "[NpcChat] Bot history scrub stopped early: {}", e.what());
+        }
+        return stats;
+    }
+
 
     // --- guild bot presence -----------------------------------------------------
     // Keep actual Playerbots guild characters online while at least one real
@@ -5562,7 +5693,7 @@ namespace
             std::lock_guard<std::mutex> lock(g_FileMutex);
             EnsureBotChatDirectories();
             characterCard = LoadBotCharacterCard(req.botName);
-            history = LoadHistoryTail(historyPath, cfg.historyTail);
+            history = ScrubAndLoadBotHistoryTail(historyPath, cfg.historyTail, cfg.blacklist);
             AppendHistoryLine(historyPath, req.playerName + ": " + req.message);
         }
 
@@ -5612,13 +5743,14 @@ namespace
     struct BotSocialCfg
     {
         bool enable = true;
-        uint32 partyChancePct = 70;
+        uint32 partyChancePct = 100;
         uint32 raidChancePct = 35;
         uint32 guildChancePct = 55;
         int partyMaxSpeakers = 3;
         int raidMaxSpeakers = 2;
         int guildMaxSpeakers = 3;
         uint32 randomBotChancePct = 25;
+        int partyCooldownSec = 4;
         int cooldownSec = 20;
     };
 
@@ -5626,13 +5758,14 @@ namespace
     {
         BotSocialCfg c;
         c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Social.Enable", true, false);
-        c.partyChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.PartyChancePct", 70, false));
+        c.partyChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.PartyChancePct", 100, false));
         c.raidChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RaidChancePct", 35, false));
         c.guildChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.GuildChancePct", 55, false));
         c.partyMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.PartyMaxSpeakers", 3, false)));
         c.raidMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.RaidMaxSpeakers", 2, false)));
         c.guildMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.GuildMaxSpeakers", 3, false)));
         c.randomBotChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RandomBotChancePct", 25, false));
+        c.partyCooldownSec = std::max(0, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.PartyCooldownSec", 4, false));
         c.cooldownSec = std::max(0, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.CooldownSec", 20, false));
         return c;
     }
@@ -5759,8 +5892,9 @@ namespace
         std::string conversation = req.playerName + ": " + req.message;
         BotCfg const cfg = GetBotCfg();
 
-        for (BotChatRequest turn : req.turns)
+        for (size_t turnIndex = 0; turnIndex < req.turns.size(); ++turnIndex)
         {
+            BotChatRequest turn = req.turns[turnIndex];
             std::string historyPath = BotPersonalHistoryFilePath(
                 turn.playerName, turn.playerGuidRaw, turn.botName, turn.botGuidRaw);
             std::deque<std::string> history;
@@ -5769,7 +5903,7 @@ namespace
                 std::lock_guard<std::mutex> lock(g_FileMutex);
                 EnsureBotChatDirectories();
                 card = LoadBotCharacterCard(turn.botName);
-                history = LoadHistoryTail(historyPath, cfg.historyTail);
+                history = ScrubAndLoadBotHistoryTail(historyPath, cfg.historyTail, cfg.blacklist);
                 AppendHistoryLine(historyPath, turn.playerName + ": " + turn.message);
             }
 
@@ -5791,6 +5925,8 @@ namespace
                 << "\n\nAdd one short natural line as " << turn.botName;
             if (req.channel == BotSocialChannel::Guild)
                 user << ". You were selected to participate in guild chat, so give a natural in-character reply; do not output [SKIP].";
+            else if (req.channel == BotSocialChannel::Party && turnIndex == 0)
+                user << ". You are the first selected party companion. Give one natural in-character reply so the player's party message is acknowledged; do not output [SKIP].";
             else
                 user << ". If you truly have nothing to add, output exactly [SKIP].";
 
@@ -6140,7 +6276,9 @@ namespace
             if (chance == 0 || (chance < 100 && (std::rand() % 100) >= chance))
                 return;
             std::string cooldownKey = "group:" + std::to_string(group->GetGUID().GetRawValue());
-            if (!BotSocialAmbientAllowed(cooldownKey, social.cooldownSec))
+            int const cooldownSec = socialChannel == BotSocialChannel::Party ?
+                social.partyCooldownSec : social.cooldownSec;
+            if (!BotSocialAmbientAllowed(cooldownKey, cooldownSec))
                 return;
         }
 
@@ -6485,7 +6623,7 @@ namespace
             std::lock_guard<std::mutex> lock(g_FileMutex);
             EnsureBotChatDirectories();
             characterCard = LoadBotCharacterCard(req.botName);
-            history = LoadHistoryTail(historyPath, cfg.historyTail);
+            history = ScrubAndLoadBotHistoryTail(historyPath, cfg.historyTail, cfg.blacklist);
             AppendHistoryLine(historyPath, req.playerName + ": " + req.message);
         }
 
@@ -7437,6 +7575,7 @@ private:
             handler->PSendSysMessage(".npcc key");
             handler->PSendSysMessage(".npcc status");
             handler->PSendSysMessage(".npcc health [test|reset]");
+            handler->PSendSysMessage(".npcc bot history scrub");
             handler->PSendSysMessage(".npcc reload");
             handler->PSendSysMessage(".npcc reset");
             handler->PSendSysMessage(".npcc rel");
@@ -7473,6 +7612,29 @@ private:
             handler->PSendSysMessage("GM: .npcc prompt default [quoted default prompt]");
             handler->PSendSysMessage("GM/Allowed: .npcc sub create <name> [quoted prompt text]");
             handler->PSendSysMessage("GM/Allowed: .npcc sub attach shared <name>");
+            return true;
+        }
+
+        if (StartsWithWord(arg, "bot", rest))
+        {
+            std::string historyRest;
+            if (StartsWithWord(rest, "history", historyRest))
+            {
+                std::string actionRest;
+                if (StartsWithWord(historyRest, "scrub", actionRest))
+                {
+                    BotCfg const cfg = GetBotCfg();
+                    BotHistoryScrubStats stats;
+                    {
+                        std::lock_guard<std::mutex> lock(g_FileMutex);
+                        stats = ScrubAllBotPersonalHistory(cfg.blacklist);
+                    }
+                    handler->PSendSysMessage("Bot RP history scrub complete: {} file(s) scanned, {} addon/Playerbots command line(s) removed.",
+                        stats.filesScanned, stats.linesRemoved);
+                    return true;
+                }
+            }
+            handler->PSendSysMessage("Usage: .npcc bot history scrub");
             return true;
         }
 

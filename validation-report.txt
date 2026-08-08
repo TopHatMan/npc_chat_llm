@@ -1,0 +1,10 @@
+NpcChat config contract: 124 canonical keys, 128 source keys, 4 legacy aliases.
+NpcChat config contract OK (including required [worldserver] header).
+config_contract=0
+party_chance=0
+party_cooldown=0
+history_scrub=0
+party_required_reply=0
+scrub_command=0
+PLAYERBOT_CHAT.md:185: new blank line at EOF.
+diff_check=2
