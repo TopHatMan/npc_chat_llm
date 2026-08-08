@@ -503,13 +503,6 @@ NpcChat_LLMResult NpcChatTransport::Call(const NpcChat_ApiConfig& cfg,
         return rejection;
     }
 
-    struct SlotGuard
-    {
-        NpcChatTransport& transport;
-        NpcChat_RequestClass requestClass;
-        ~SlotGuard() { transport.Release(requestClass); }
-    } guard{ *this, requestClass };
-
     std::string const bodyStr = body.dump();
     constexpr int MAX_ATTEMPTS = 2;
     NpcChat_LLMResult lastFailure;
@@ -584,6 +577,7 @@ NpcChat_LLMResult NpcChatTransport::Call(const NpcChat_ApiConfig& cfg,
             result.text = std::move(text);
             result.httpStatus = http.status;
             result.attempts = attempt;
+            Release(requestClass);
             RecordSuccess(requestClass);
             return result;
         }
@@ -597,6 +591,7 @@ NpcChat_LLMResult NpcChatTransport::Call(const NpcChat_ApiConfig& cfg,
 
     if (lastFailure.error == NpcChat_LLMError::None)
         lastFailure = MakeFailure(NpcChat_LLMError::Transport, "request failed without a diagnostic result");
+    Release(requestClass);
     RecordFailure(cfg, requestClass, label, lastFailure);
     return lastFailure;
 }
