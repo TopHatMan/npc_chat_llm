@@ -42,7 +42,8 @@
 #include "AiFactory.h"      // GetPlayerSpecTab
 #include "ChatHelper.h"     // FormatClass (readable spec)
 #include "Guild.h"          // BroadcastToGuild
-#include "Channel.h"        // Channel::Say / IsOn
+#include "Channel.h"        // Channel::Say
+#include "ChannelMgr.h"     // find General/Trade channel on world thread
 #include <set>
 
 #include <algorithm>
@@ -6573,11 +6574,12 @@ namespace
                 }
                 else // ChannelMsg
                 {
-                    // Channel::Say needs the bot to be a channel member and Channel::IsOn is
-                    // private in this core, so we can't gate it. Whisper the requester instead:
-                    // reliable, and the natural LFG UX (the recruiter is told directly).
-                    if (player)
-                        bot->Whisper(r.text, LANG_UNIVERSAL, player);
+                    // A playerbot only whispers when the real player whispered it first. Channel/LFG
+                    // replies therefore stay in the originating channel instead of falling back to a DM.
+                    // GetChannel(..., pkt=false) quietly returns null when the bot is not a member.
+                    if (ChannelMgr* channelMgr = ChannelMgr::forTeam(bot->GetTeamId()))
+                        if (Channel* channel = channelMgr->GetChannel(r.channelName, bot, false))
+                            channel->Say(bot->GetGUID(), r.text, LANG_UNIVERSAL);
                 }
             }
             local.pop();
