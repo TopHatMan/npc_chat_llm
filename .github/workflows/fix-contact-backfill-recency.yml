@@ -1,0 +1,33 @@
+name: Fix contact backfill recency
+
+on:
+  push:
+    branches:
+      - agent/living-guild-raid-npc-whispers
+    paths:
+      - scripts/fix_contact_backfill_recency.py
+      - .github/workflows/fix-contact-backfill-recency.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/living-guild-raid-npc-whispers
+      - run: python scripts/fix_contact_backfill_recency.py
+      - name: Commit source fix
+        shell: bash
+        run: |
+          if git diff --quiet -- src/mod_npcchat.cpp; then
+            echo "No source changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/mod_npcchat.cpp
+          git commit -m "Preserve NPC contact recency during history backfill"
+          git push origin HEAD:agent/living-guild-raid-npc-whispers
