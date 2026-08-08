@@ -5206,7 +5206,7 @@ namespace
         cfg.triggerRange = sConfigMgr->GetOption<float>("NpcChat.Bot.TriggerRange", 25.0f, false);
         cfg.historyTail = sConfigMgr->GetOption<int32>("NpcChat.Bot.HistoryMaxLines", 20, false);
         cfg.characterCardsPath = sConfigMgr->GetOption<std::string>(
-            "NpcChat.Bot.CharacterCardsPath", "./characters");
+            "NpcChat.Bot.CharacterCardsPath", "./characters", false);
         return cfg;
     }
 
@@ -5231,9 +5231,9 @@ namespace
         cfg.scanIntervalSec = std::max<uint32>(1,
             sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildPresence.ScanIntervalSec", 10, false));
         cfg.maxLoginsPerScan = sConfigMgr->GetOption<uint32>(
-            "NpcChat.Bot.GuildPresence.MaxLoginsPerScan", 20);
+            "NpcChat.Bot.GuildPresence.MaxLoginsPerScan", 20, false);
         cfg.includeAddClass = sConfigMgr->GetOption<bool>(
-            "NpcChat.Bot.GuildPresence.IncludeAddClass", true);
+            "NpcChat.Bot.GuildPresence.IncludeAddClass", true, false);
         return cfg;
     }
 
