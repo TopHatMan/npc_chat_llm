@@ -148,10 +148,10 @@ namespace
     // the normal chat model and real personal chat history, so keep the chance/cooldowns conservative.
     bool        g_HistoryWhispersEnabled = true;
     float       g_HistoryWhispersTriggerDistance = 18.0f;
-    int         g_HistoryWhispersChancePct = 12;
-    int         g_HistoryWhispersPlayerCooldownSec = 300;
-    int         g_HistoryWhispersPairCooldownSec = 900;
-    int         g_HistoryWhispersScanIntervalMs = 5000;
+    int         g_HistoryWhispersChancePct = 5;
+    int         g_HistoryWhispersPlayerCooldownSec = 600;
+    int         g_HistoryWhispersPairCooldownSec = 1800;
+    int         g_HistoryWhispersScanIntervalMs = 8000;
     int         g_HistoryWhispersHistoryMaxLines = 8;
 
     // Cached hostile first-talk barks: elite/intelligent enemies can speak first
@@ -323,10 +323,10 @@ namespace
 
         g_HistoryWhispersEnabled = sConfigMgr->GetOption<bool>("NpcChat.HistoryWhispers.Enabled", true);
         g_HistoryWhispersTriggerDistance = sConfigMgr->GetOption<float>("NpcChat.HistoryWhispers.TriggerDistance", 18.0f);
-        g_HistoryWhispersChancePct = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ChancePct", 12);
-        g_HistoryWhispersPlayerCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PlayerCooldownSec", 300);
-        g_HistoryWhispersPairCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PairCooldownSec", 900);
-        g_HistoryWhispersScanIntervalMs = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ScanIntervalMs", 5000);
+        g_HistoryWhispersChancePct = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ChancePct", 5);
+        g_HistoryWhispersPlayerCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PlayerCooldownSec", 600);
+        g_HistoryWhispersPairCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PairCooldownSec", 1800);
+        g_HistoryWhispersScanIntervalMs = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ScanIntervalMs", 8000);
         g_HistoryWhispersHistoryMaxLines = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.HistoryMaxLines", 8);
         g_HistoryWhispersChancePct = std::max(0, std::min(100, g_HistoryWhispersChancePct));
         g_HistoryWhispersScanIntervalMs = std::max(1000, g_HistoryWhispersScanIntervalMs);
@@ -5650,6 +5650,8 @@ namespace
                 alts.push_back(bot);
         }
 
+        bool const randomOnlyPool = named.empty() && alts.empty() && !randoms.empty();
+
         std::vector<Player*> out;
         auto addUnique = [&](Player* bot)
         {
@@ -5674,7 +5676,10 @@ namespace
 
         while (static_cast<int>(out.size()) < maxSpeakers && !alts.empty())
             addUnique(TakeRandomBot(alts));
-        while (static_cast<int>(out.size()) < maxSpeakers && out.empty() && !randoms.empty())
+
+        // If the entire eligible pool is random Playerbots, it is still valid to use the
+        // configured speaker cap. The old out.empty() condition limited these groups to one voice.
+        while (static_cast<int>(out.size()) < maxSpeakers && randomOnlyPool && !randoms.empty())
             addUnique(TakeRandomBot(randoms));
 
         return out;
@@ -5756,6 +5761,203 @@ namespace
             std::lock_guard<std::mutex> lock(BotSocialReplyMutex());
             BotSocialReplyQueue().push(std::move(reply));
         }
+    }
+
+
+    // --- autonomous guild ambience ----------------------------------------------
+    struct GuildAmbientCfg
+    {
+        bool enable = true;
+        uint32 minIntervalSec = 90;
+        uint32 maxIntervalSec = 240;
+        int maxSpeakers = 2;
+        uint32 randomBotChancePct = 15;
+        int historyTail = 12;
+    };
+
+    inline GuildAmbientCfg GetGuildAmbientCfg()
+    {
+        GuildAmbientCfg c;
+        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.GuildAmbient.Enable", true, false);
+        c.minIntervalSec = std::max<uint32>(15,
+            sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildAmbient.MinIntervalSec", 90, false));
+        c.maxIntervalSec = std::max<uint32>(c.minIntervalSec,
+            sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildAmbient.MaxIntervalSec", 240, false));
+        c.maxSpeakers = std::max(1, std::min(3,
+            sConfigMgr->GetOption<int32>("NpcChat.Bot.GuildAmbient.MaxSpeakers", 2, false)));
+        c.randomBotChancePct = std::min<uint32>(100,
+            sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildAmbient.RandomBotChancePct", 15, false));
+        c.historyTail = std::max(0, std::min(30,
+            sConfigMgr->GetOption<int32>("NpcChat.Bot.GuildAmbient.HistoryMaxLines", 12, false)));
+        return c;
+    }
+
+    inline std::map<uint32, time_t>& GuildAmbientNextAt()
+    {
+        static std::map<uint32, time_t> nextAt;
+        return nextAt;
+    }
+
+    inline uint32 GuildAmbientDelay(GuildAmbientCfg const& cfg)
+    {
+        if (cfg.maxIntervalSec <= cfg.minIntervalSec)
+            return cfg.minIntervalSec;
+        uint32 const span = cfg.maxIntervalSec - cfg.minIntervalSec + 1;
+        return cfg.minIntervalSec + static_cast<uint32>(std::rand()) % span;
+    }
+
+    inline std::string BotGuildAmbientHistoryFilePath(uint32 guildId)
+    {
+        return g_HistoryPath + "/bots/guild/" + std::to_string(guildId) + ".history";
+    }
+
+    struct BotGuildAmbientConversationRequest
+    {
+        uint32 guildId = 0;
+        int historyTail = 12;
+        std::vector<BotChatRequest> turns;
+    };
+
+    inline void BotGuildAmbientConversationWorker(BotGuildAmbientConversationRequest req)
+    {
+        std::string const historyPath = BotGuildAmbientHistoryFilePath(req.guildId);
+        std::deque<std::string> recentGuildHistory;
+        {
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            try { std::filesystem::create_directories(g_HistoryPath + "/bots/guild"); }
+            catch (std::exception const&) {}
+            recentGuildHistory = LoadHistoryTail(historyPath, req.historyTail);
+        }
+
+        std::string conversation;
+        for (size_t i = 0; i < req.turns.size(); ++i)
+        {
+            BotChatRequest turn = req.turns[i];
+            std::string card;
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                EnsureBotChatDirectories();
+                card = LoadBotCharacterCard(turn.botName);
+            }
+            card = ExpandBotCharacterCard(turn, std::move(card));
+
+            std::string system = BuildBotSystemPrompt(turn, card);
+            system += "\n\nYou are casually participating in guild chat without being directly addressed by a player. "
+                "Sound like an adventurer who actually belongs to this guild. Keep it short and ordinary. "
+                "Good topics include where you are headed, questing, dungeons, professions, supplies, gear, "
+                "travel, asking what guildmates are doing, or a light joke. Do not invent major server events, "
+                "boss kills, rare loot drops, emergencies, or facts you were not given.";
+
+            std::ostringstream user;
+            if (!recentGuildHistory.empty())
+            {
+                user << "Recent ambient guild chat:\n";
+                for (std::string const& line : recentGuildHistory)
+                    user << line << "\n";
+                user << "\n";
+            }
+
+            if (conversation.empty())
+            {
+                user << "Start one short, natural guild-chat line as " << turn.botName
+                    << ". This is an idle social moment, not a response to a hidden player message. "
+                    << "If nothing suitable comes to mind, output exactly [SKIP].";
+            }
+            else
+            {
+                user << "Guild conversation so far:\n" << conversation
+                    << "\n\nAdd one short natural guild-chat reply as " << turn.botName
+                    << ". React only to what was actually said. If you truly have nothing to add, output exactly [SKIP].";
+            }
+
+            NpcChat_LLMResult res = NpcChat_CallBackgroundLLM(
+                BuildChatApiConfig(), system, user.str(), "guild-ambient");
+            std::string line = TrimCopy(res.text);
+            if (!res.success || line.empty() || ToLowerCopy(line) == "[skip]")
+                continue;
+
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                AppendHistoryLine(historyPath, turn.botName + ": " + line);
+            }
+            recentGuildHistory.push_back(turn.botName + ": " + line);
+            while (static_cast<int>(recentGuildHistory.size()) > req.historyTail && !recentGuildHistory.empty())
+                recentGuildHistory.pop_front();
+
+            if (!conversation.empty())
+                conversation += "\n";
+            conversation += turn.botName + ": " + line;
+
+            BotSocialReply reply;
+            reply.botGuidRaw = turn.botGuidRaw;
+            reply.channel = BotSocialChannel::Guild;
+            reply.text = std::move(line);
+            std::lock_guard<std::mutex> lock(BotSocialReplyMutex());
+            BotSocialReplyQueue().push(std::move(reply));
+        }
+    }
+
+    inline void MaybeStartGuildAmbientChat(Player* realPlayer)
+    {
+        if (!IsRealPlayerSession(realPlayer))
+            return;
+
+        GuildAmbientCfg const cfg = GetGuildAmbientCfg();
+        if (!cfg.enable)
+            return;
+
+        uint32 const guildId = realPlayer->GetGuildId();
+        Guild* guild = realPlayer->GetGuild();
+        if (!guildId || !guild)
+            return;
+
+        time_t const now = std::time(nullptr);
+        time_t& nextAt = GuildAmbientNextAt()[guildId];
+        if (nextAt == 0)
+        {
+            nextAt = now + GuildAmbientDelay(cfg);
+            return; // never chatter immediately just because a player logged in
+        }
+        if (now < nextAt)
+            return;
+
+        // Schedule the next attempt before doing any work so multiple real members updating on
+        // the same world tick cannot multiply the ambient rate for one guild.
+        nextAt = now + GuildAmbientDelay(cfg);
+
+        std::vector<Player*> candidates;
+        auto collectOnlineBot = [&](Player* member)
+        {
+            if (member && member != realPlayer && IsGenuineBot(member) && member->GetGuildId() == guildId)
+                candidates.push_back(member);
+        };
+        guild->BroadcastWorker(collectOnlineBot, realPlayer);
+        if (candidates.empty())
+            return;
+
+        std::vector<Player*> chosen = ChooseSocialBots(
+            candidates, "", cfg.maxSpeakers, cfg.randomBotChancePct);
+        if (chosen.empty())
+            return;
+
+        BotGuildAmbientConversationRequest req;
+        req.guildId = guildId;
+        req.historyTail = cfg.historyTail;
+        for (Player* bot : chosen)
+        {
+            if (!bot || !IsGenuineBot(bot))
+                continue;
+            BotChatRequest turn;
+            turn.botGuidRaw = bot->GetGUID().GetRawValue();
+            turn.botName = bot->GetName();
+            turn.botLevel = bot->GetLevel();
+            turn.botGender = BotGenderName(bot->getGender());
+            turn.botRace = BotRaceName(bot->getRace());
+            turn.botClass = BotClassName(bot->getClass());
+            req.turns.push_back(std::move(turn));
+        }
+        if (!req.turns.empty())
+            std::thread(BotGuildAmbientConversationWorker, std::move(req)).detach();
     }
 
     inline void DispatchBotSocialConversation(Player* player, std::vector<Player*> const& bots,
@@ -6582,6 +6784,7 @@ public:
         // Guild presence is independent of whether the real player is currently
         // alive; dying/ghosting should not make their guild roster disappear.
         EnsureGuildBotsOnline(player);
+        MaybeStartGuildAmbientChat(player);
 
         if (!player->IsAlive())
             return;
