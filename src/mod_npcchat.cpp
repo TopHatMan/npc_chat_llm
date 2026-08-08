@@ -1916,6 +1916,75 @@ namespace
         return out;
     }
 
+    // Backfill the lightweight contact index from existing personal NPC history files so
+    // conversations from before HistoryWhispers was added are immediately eligible too.
+    // The legacy filename contains the NPC entry only when NameByEntry is enabled.
+    int ImportNpcContactsFromExistingHistory()
+    {
+        if (!g_NameByEntry)
+            return 0;
+
+        std::filesystem::path root(g_HistoryPath + "/personal");
+        try
+        {
+            if (!std::filesystem::exists(root))
+                return 0;
+        }
+        catch (std::exception const&)
+        {
+            return 0;
+        }
+
+        int imported = 0;
+        try
+        {
+            for (auto const& item : std::filesystem::recursive_directory_iterator(root))
+            {
+                if (!item.is_regular_file() || item.path().extension() != ".history")
+                    continue;
+
+                // Player folder: <sanitized-player-name>_<raw-guid>
+                std::string folder = item.path().parent_path().filename().string();
+                size_t playerSep = folder.find_last_of('_');
+                if (playerSep == std::string::npos || playerSep + 1 >= folder.size())
+                    continue;
+
+                // NPC file stem: <sanitized-npc-name>_<entry>
+                std::string stem = item.path().stem().string();
+                size_t npcSep = stem.find_last_of('_');
+                if (npcSep == std::string::npos || npcSep + 1 >= stem.size())
+                    continue;
+
+                uint64_t playerGuid = 0;
+                uint32 npcEntry = 0;
+                try
+                {
+                    playerGuid = static_cast<uint64_t>(std::stoull(folder.substr(playerSep + 1)));
+                    npcEntry = static_cast<uint32>(std::stoul(stem.substr(npcSep + 1)));
+                }
+                catch (std::exception const&)
+                {
+                    continue;
+                }
+                if (!playerGuid || !npcEntry)
+                    continue;
+
+                // Ignore empty history files. The index should mean an actual conversation existed.
+                std::error_code ec;
+                if (std::filesystem::file_size(item.path(), ec) == 0 || ec)
+                    continue;
+
+                TouchNpcContact(playerGuid, npcEntry, folder.substr(0, playerSep), stem.substr(0, npcSep));
+                ++imported;
+            }
+        }
+        catch (std::exception const&)
+        {
+            // Best-effort migration. New conversations still populate the index normally.
+        }
+        return imported;
+    }
+
     std::string PlayerRaceName(uint8 race)
     {
         switch (race)
@@ -6690,6 +6759,9 @@ public:
         EnsureNpcChatDirectoriesAndDefaultPrompt();
         EnsureQuestBarkCacheTable();
         EnsureNpcContactTable();
+        int importedContacts = ImportNpcContactsFromExistingHistory();
+        if (importedContacts > 0)
+            LOG_INFO("module", "[NpcChat] HistoryWhispers contact index: {} existing personal history file(s) imported.", importedContacts);
     }
 
     void OnUpdate(uint32 diff) override
