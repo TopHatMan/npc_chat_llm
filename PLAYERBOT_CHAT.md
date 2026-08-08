@@ -182,4 +182,3 @@ The command recursively scans `NpcChat.HistoryPath/bots/personal/` and removes l
 ## Party responsiveness
 
 Party chat is intentionally more responsive than raid/guild ambient chatter. By default a real player's eligible party message triggers the bot conversation path at 100%, uses a short 4-second party cooldown, and the first selected companion must produce a real reply instead of `[SKIP]`. Additional selected companions may still stay quiet. Bot-control/addon messages remain filtered before this logic.
-

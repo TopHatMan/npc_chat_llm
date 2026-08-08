@@ -5930,7 +5930,16 @@ namespace
             else
                 user << ". If you truly have nothing to add, output exactly [SKIP].";
 
-            NpcChat_LLMResult res = NpcChat_CallBackgroundLLM(BuildChatApiConfig(), system, user.str(), "bot-social");
+            NpcChat_LLMResult res;
+            if (req.channel == BotSocialChannel::Party && turnIndex == 0)
+            {
+                res = NpcChat_CallLLM(BuildChatApiConfig(), system, user.str(),
+                    NpcChat_RequestClass::Interactive, "party-direct");
+            }
+            else
+            {
+                res = NpcChat_CallBackgroundLLM(BuildChatApiConfig(), system, user.str(), "bot-social");
+            }
             std::string line = TrimCopy(res.text);
             if (!res.success || line.empty() || ToLowerCopy(line) == "[skip]")
                 continue;
@@ -6203,8 +6212,11 @@ namespace
                 {
                     ChatMsg type = r.channel == BotSocialChannel::Raid ? CHAT_MSG_RAID : CHAT_MSG_PARTY;
                     WorldPacket data;
-                    ChatHandler::BuildChatPacket(data, type, LANG_UNIVERSAL, bot, bot, r.text);
-                    group->BroadcastPacket(&data, false);
+                    ChatHandler::BuildChatPacket(data, type, LANG_UNIVERSAL, bot, nullptr, r.text);
+                    if (r.channel == BotSocialChannel::Party)
+                        group->BroadcastPacket(&data, false, group->GetMemberGroup(bot->GetGUID()));
+                    else
+                        group->BroadcastPacket(&data, false);
                 }
             }
             local.pop();
@@ -6335,8 +6347,11 @@ namespace
                         WorldPacket data;
                         // [AC-API] BuildChatPacket / BroadcastPacket signatures vary by core.
                         // Fallback: loop g members and SendDirectMessage per receiver.
-                        ChatHandler::BuildChatPacket(data, cm, LANG_UNIVERSAL, bot, bot, r.text);
-                        g->BroadcastPacket(&data, false);
+                        ChatHandler::BuildChatPacket(data, cm, LANG_UNIVERSAL, bot, nullptr, r.text);
+                        if (r.channel == BotChannel::Party)
+                            g->BroadcastPacket(&data, false, g->GetMemberGroup(bot->GetGUID()));
+                        else
+                            g->BroadcastPacket(&data, false);
                     }
                     break;
                 }
