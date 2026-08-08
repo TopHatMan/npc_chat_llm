@@ -5739,8 +5739,11 @@ namespace
                 user << "\n";
             }
             user << "Conversation so far:\n" << conversation
-                << "\n\nAdd one short natural line as " << turn.botName
-                << ". If you truly have nothing to add, output exactly [SKIP].";
+                << "\n\nAdd one short natural line as " << turn.botName;
+            if (req.channel == BotSocialChannel::Guild)
+                user << ". You were selected to participate in guild chat, so give a natural in-character reply; do not output [SKIP].";
+            else
+                user << ". If you truly have nothing to add, output exactly [SKIP].";
 
             NpcChat_LLMResult res = NpcChat_CallBackgroundLLM(BuildChatApiConfig(), system, user.str(), "bot-social");
             std::string line = TrimCopy(res.text);
