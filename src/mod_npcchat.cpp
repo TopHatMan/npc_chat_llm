@@ -142,7 +142,7 @@ namespace
     // History-aware proximity whispers: an NPC the player has actually spoken with before may
     // privately recognize them when they pass nearby. Unlike cached relationship barks, this uses
     // the normal chat model and real personal chat history, so keep the chance/cooldowns conservative.
-    bool        g_HistoryWhispersEnabled = false;
+    bool        g_HistoryWhispersEnabled = true;
     float       g_HistoryWhispersTriggerDistance = 18.0f;
     int         g_HistoryWhispersChancePct = 12;
     int         g_HistoryWhispersPlayerCooldownSec = 300;
@@ -312,7 +312,7 @@ namespace
         if (g_RelationshipBarksScanIntervalMs < 500)
             g_RelationshipBarksScanIntervalMs = 500;
 
-        g_HistoryWhispersEnabled = sConfigMgr->GetOption<bool>("NpcChat.HistoryWhispers.Enabled", false);
+        g_HistoryWhispersEnabled = sConfigMgr->GetOption<bool>("NpcChat.HistoryWhispers.Enabled", true);
         g_HistoryWhispersTriggerDistance = sConfigMgr->GetOption<float>("NpcChat.HistoryWhispers.TriggerDistance", 18.0f);
         g_HistoryWhispersChancePct = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ChancePct", 12);
         g_HistoryWhispersPlayerCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PlayerCooldownSec", 300);
@@ -5403,7 +5403,7 @@ namespace
     // --- controlled social conversations ----------------------------------------
     struct BotSocialCfg
     {
-        bool enable = false;
+        bool enable = true;
         uint32 partyChancePct = 70;
         uint32 raidChancePct = 35;
         uint32 guildChancePct = 55;
@@ -5417,7 +5417,7 @@ namespace
     inline BotSocialCfg GetBotSocialCfg()
     {
         BotSocialCfg c;
-        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Social.Enable", false);
+        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Social.Enable", true);
         c.partyChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.PartyChancePct", 70));
         c.raidChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RaidChancePct", 35));
         c.guildChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.GuildChancePct", 55));
