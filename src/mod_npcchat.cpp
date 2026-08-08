@@ -139,6 +139,17 @@ namespace
     int         g_RelationshipBarksScanIntervalMs = 2000;
     bool        g_RelationshipBarksGenerateMissing = false;
 
+    // History-aware proximity whispers: an NPC the player has actually spoken with before may
+    // privately recognize them when they pass nearby. Unlike cached relationship barks, this uses
+    // the normal chat model and real personal chat history, so keep the chance/cooldowns conservative.
+    bool        g_HistoryWhispersEnabled = true;
+    float       g_HistoryWhispersTriggerDistance = 18.0f;
+    int         g_HistoryWhispersChancePct = 12;
+    int         g_HistoryWhispersPlayerCooldownSec = 300;
+    int         g_HistoryWhispersPairCooldownSec = 900;
+    int         g_HistoryWhispersScanIntervalMs = 5000;
+    int         g_HistoryWhispersHistoryMaxLines = 8;
+
     // Cached hostile first-talk barks: elite/intelligent enemies can speak first
     // from saved shared .hostile_barks files. Cache-only by default; no proximity
     // scan will ever call the LLM in this safe pass.
@@ -301,6 +312,17 @@ namespace
         if (g_RelationshipBarksScanIntervalMs < 500)
             g_RelationshipBarksScanIntervalMs = 500;
 
+        g_HistoryWhispersEnabled = sConfigMgr->GetOption<bool>("NpcChat.HistoryWhispers.Enabled", true);
+        g_HistoryWhispersTriggerDistance = sConfigMgr->GetOption<float>("NpcChat.HistoryWhispers.TriggerDistance", 18.0f);
+        g_HistoryWhispersChancePct = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ChancePct", 12);
+        g_HistoryWhispersPlayerCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PlayerCooldownSec", 300);
+        g_HistoryWhispersPairCooldownSec = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.PairCooldownSec", 900);
+        g_HistoryWhispersScanIntervalMs = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.ScanIntervalMs", 5000);
+        g_HistoryWhispersHistoryMaxLines = sConfigMgr->GetOption<int32>("NpcChat.HistoryWhispers.HistoryMaxLines", 8);
+        g_HistoryWhispersChancePct = std::max(0, std::min(100, g_HistoryWhispersChancePct));
+        g_HistoryWhispersScanIntervalMs = std::max(1000, g_HistoryWhispersScanIntervalMs);
+        g_HistoryWhispersHistoryMaxLines = std::max(2, std::min(20, g_HistoryWhispersHistoryMaxLines));
+
         g_HostileFirstTalkEnabled = sConfigMgr->GetOption<bool>("NpcChat.HostileFirstTalk.Enabled", false);
         g_HostileFirstTalkRealPlayersOnly = sConfigMgr->GetOption<bool>("NpcChat.HostileFirstTalk.RealPlayersOnly", true);
         g_HostileFirstTalkTriggerDistance = sConfigMgr->GetOption<float>("NpcChat.HostileFirstTalk.TriggerDistance", 35.0f);
@@ -432,6 +454,7 @@ namespace
         uint64_t    npcGuidRaw = 0;
         std::string text;
         bool        forcePrivateReply = false;
+        bool        whisper = false; // true = real creature whisper packet, not targeted /say
     };
 
     struct SystemMessage
@@ -552,6 +575,10 @@ namespace
     std::map<uint64_t, time_t> g_RelationshipBarkPlayerCooldownUntil;
     std::map<uint64_t, time_t> g_RelationshipBarkNpcCooldownUntil;
     std::map<std::string, time_t> g_RelationshipBarkPairCooldownUntil;
+
+    // Main-thread-only cooldowns for history-aware NPC whispers.
+    std::map<uint64_t, time_t> g_HistoryWhisperPlayerCooldownUntil;
+    std::map<std::string, time_t> g_HistoryWhisperPairCooldownUntil;
 
     // Main-thread-only cooldowns for cached hostile first-talk barks.
     std::map<uint64_t, time_t> g_HostileBarkPlayerCooldownUntil;
@@ -1845,6 +1872,124 @@ namespace
         if (QueryResult r = WorldDatabase.Query(q.str().c_str()))
             do { out.push_back(r->Fetch()[0].Get<uint32>()); } while (r->NextRow());
         return out;
+    }
+
+    // Lightweight index of NPCs the player has actually chatted with. The history remains file-backed;
+    // this table exists only so proximity scans can cheaply ask which creature entries are worth checking.
+    void EnsureNpcContactTable()
+    {
+        WorldDatabase.Execute(
+            "CREATE TABLE IF NOT EXISTS `npcchat_contact` ("
+            "`player_guid` BIGINT UNSIGNED NOT NULL,"
+            "`npc_entry` INT UNSIGNED NOT NULL,"
+            "`player_name` VARCHAR(64) NOT NULL DEFAULT '',"
+            "`npc_name` VARCHAR(64) NOT NULL DEFAULT '',"
+            "`last_talked_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+            "PRIMARY KEY (`player_guid`, `npc_entry`),"
+            "KEY `idx_npcchat_contact_player` (`player_guid`, `last_talked_at`)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    }
+
+    void TouchNpcContact(uint64_t playerGuidRaw, uint32 npcEntry,
+        std::string const& playerName, std::string const& npcName)
+    {
+        if (!playerGuidRaw || !npcEntry)
+            return;
+        EnsureNpcContactTable();
+        std::ostringstream sql;
+        sql << "INSERT INTO `npcchat_contact` (`player_guid`,`npc_entry`,`player_name`,`npc_name`) VALUES ("
+            << playerGuidRaw << "," << npcEntry << ",'" << SqlEscape(playerName) << "','" << SqlEscape(npcName) << "') "
+            << "ON DUPLICATE KEY UPDATE `player_name`=VALUES(`player_name`),`npc_name`=VALUES(`npc_name`),"
+            << "`last_talked_at`=CURRENT_TIMESTAMP";
+        WorldDatabase.Execute(sql.str().c_str());
+    }
+
+    std::vector<uint32> GetPlayerContactEntries(uint64_t playerGuidRaw, uint32 cap)
+    {
+        std::vector<uint32> out;
+        EnsureNpcContactTable();
+        std::ostringstream q;
+        q << "SELECT `npc_entry` FROM `npcchat_contact` WHERE `player_guid`=" << playerGuidRaw
+            << " ORDER BY `last_talked_at` DESC LIMIT " << cap;
+        if (QueryResult r = WorldDatabase.Query(q.str().c_str()))
+            do { out.push_back(r->Fetch()[0].Get<uint32>()); } while (r->NextRow());
+        return out;
+    }
+
+    // Backfill the lightweight contact index from existing personal NPC history files so
+    // conversations from before HistoryWhispers was added are immediately eligible too.
+    // The legacy filename contains the NPC entry only when NameByEntry is enabled.
+    int ImportNpcContactsFromExistingHistory()
+    {
+        if (!g_NameByEntry)
+            return 0;
+
+        std::filesystem::path root(g_HistoryPath + "/personal");
+        try
+        {
+            if (!std::filesystem::exists(root))
+                return 0;
+        }
+        catch (std::exception const&)
+        {
+            return 0;
+        }
+
+        int imported = 0;
+        try
+        {
+            for (auto const& item : std::filesystem::recursive_directory_iterator(root))
+            {
+                if (!item.is_regular_file() || item.path().extension() != ".history")
+                    continue;
+
+                // Player folder: <sanitized-player-name>_<raw-guid>
+                std::string folder = item.path().parent_path().filename().string();
+                size_t playerSep = folder.find_last_of('_');
+                if (playerSep == std::string::npos || playerSep + 1 >= folder.size())
+                    continue;
+
+                // NPC file stem: <sanitized-npc-name>_<entry>
+                std::string stem = item.path().stem().string();
+                size_t npcSep = stem.find_last_of('_');
+                if (npcSep == std::string::npos || npcSep + 1 >= stem.size())
+                    continue;
+
+                uint64_t playerGuid = 0;
+                uint32 npcEntry = 0;
+                try
+                {
+                    playerGuid = static_cast<uint64_t>(std::stoull(folder.substr(playerSep + 1)));
+                    npcEntry = static_cast<uint32>(std::stoul(stem.substr(npcSep + 1)));
+                }
+                catch (std::exception const&)
+                {
+                    continue;
+                }
+                if (!playerGuid || !npcEntry)
+                    continue;
+
+                // Ignore empty history files. The index should mean an actual conversation existed.
+                std::error_code ec;
+                if (std::filesystem::file_size(item.path(), ec) == 0 || ec)
+                    continue;
+
+                // Backfill only missing rows. Do not refresh last_talked_at on every restart;
+                // live conversations are the only thing that should move a contact to the front.
+                std::ostringstream sql;
+                sql << "INSERT IGNORE INTO `npcchat_contact` (`player_guid`,`npc_entry`,`player_name`,`npc_name`) VALUES ("
+                    << playerGuid << "," << npcEntry << ",'"
+                    << SqlEscape(folder.substr(0, playerSep)) << "','"
+                    << SqlEscape(stem.substr(0, npcSep)) << "')";
+                WorldDatabase.Execute(sql.str().c_str());
+                ++imported;
+            }
+        }
+        catch (std::exception const&)
+        {
+            // Best-effort migration. New conversations still populate the index normally.
+        }
+        return imported;
     }
 
     std::string PlayerRaceName(uint8 race)
@@ -4802,6 +4947,9 @@ namespace
             AppendHistoryLine(personalPath, req.playerName + ": " + req.message);
         }
 
+        // Record that these two have genuinely spoken. This powers cheap future nearby-history scans.
+        TouchNpcContact(req.playerGuidRaw, req.npcEntry, req.playerName, req.npcName);
+
         NpcChat_ApiConfig cfg = BuildChatApiConfig();
 
         NpcChat_LLMResult res = NpcChat_CallLLM(
@@ -4827,6 +4975,163 @@ namespace
 
         std::lock_guard<std::mutex> lock(g_ReplyMutex);
         g_ReplyQueue.push(std::move(reply));
+    }
+
+    std::string HistoryWhisperPairKey(Player const* player, Creature const* npc)
+    {
+        if (!player || !npc)
+            return "";
+        return std::to_string(player->GetGUID().GetRawValue()) + ":history-whisper:" + std::to_string(npc->GetEntry());
+    }
+
+    void NpcHistoryWhisperWorker(ChatRequest req)
+    {
+        std::string const sharedPath = SharedHistoryFilePath(req.npcName, req.npcEntry);
+        std::string const personalPath = PersonalHistoryFilePath(req.playerName, req.playerGuidRaw, req.npcName, req.npcEntry);
+
+        std::deque<std::string> sharedHistory;
+        std::deque<std::string> personalHistory;
+        std::string defaultPrompt;
+        std::string sharedSubPrompts;
+        std::string sharedPrompt;
+        std::string personalSubPrompts;
+        std::string personalPrompt;
+        std::string relationshipText;
+
+        {
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            EnsureNpcChatDirectoriesAndDefaultPrompt();
+            personalHistory = LoadHistoryTail(personalPath, g_HistoryWhispersHistoryMaxLines);
+            if (personalHistory.empty())
+                return; // contact index is only a hint; history is the actual eligibility check
+
+            sharedHistory = LoadHistoryTail(sharedPath, std::min(g_SharedHistoryTail, g_HistoryWhispersHistoryMaxLines));
+            defaultPrompt = ReadWholeTextFile(DefaultPromptFilePath());
+            sharedSubPrompts = LoadSubPromptBlocks(LoadSubPromptNameList(SharedSubPromptListFilePath(req.npcName, req.npcEntry)));
+            sharedPrompt = ReadWholeTextFile(SharedPromptFilePath(req.npcName, req.npcEntry));
+            personalSubPrompts = LoadSubPromptBlocks(LoadSubPromptNameList(
+                PersonalSubPromptListFilePath(req.playerName, req.playerGuidRaw, req.npcName, req.npcEntry)));
+            personalPrompt = ReadWholeTextFile(PersonalPromptFilePath(req.playerName, req.playerGuidRaw, req.npcName, req.npcEntry));
+            relationshipText = LoadRelationshipText(req.playerGuidRaw, req.npcEntry, req.playerName, req.npcName);
+        }
+
+        std::ostringstream user;
+        user << "You notice " << req.playerName << " nearby again. You have spoken with this person before. "
+            << "Privately whisper one short, natural, in-character line that feels like recognition or a continuation of your prior conversations. "
+            << "Base it on the history below; do not invent major shared events that are not present. Do not narrate actions.\n\n"
+            << "Recent one-on-one history:\n";
+        for (std::string const& line : personalHistory)
+            user << line << "\n";
+        user << "\nWhisper as " << req.npcName << ":";
+
+        NpcChat_LLMResult res = NpcChat_CallLLM(
+            BuildChatApiConfig(),
+            BuildSystemPrompt(req, defaultPrompt, sharedSubPrompts, sharedPrompt, personalSubPrompts, personalPrompt, relationshipText),
+            user.str());
+        if (!res.success || TrimCopy(res.text).empty())
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock(g_FileMutex);
+            AppendHistoryLine(sharedPath, req.npcName + " privately to [" + req.playerName + "]: " + res.text);
+            AppendHistoryLine(personalPath, req.npcName + " whispers: " + res.text);
+        }
+
+        ChatReply reply;
+        reply.playerGuidRaw = req.playerGuidRaw;
+        reply.npcGuidRaw = req.npcGuidRaw;
+        reply.text = res.text;
+        reply.forcePrivateReply = true;
+        reply.whisper = true;
+        std::lock_guard<std::mutex> lock(g_ReplyMutex);
+        g_ReplyQueue.push(std::move(reply));
+    }
+
+    ChatRequest CaptureHistoryWhisperRequest(Player* player, Creature* npc)
+    {
+        ChatRequest req;
+        if (!player || !npc)
+            return req;
+        req.playerGuidRaw = player->GetGUID().GetRawValue();
+        req.npcGuidRaw = npc->GetGUID().GetRawValue();
+        req.npcEntry = npc->GetEntry();
+        req.playerName = player->GetName();
+        req.npcName = npc->GetName();
+        req.npcLevel = npc->GetLevel();
+        req.gender = GenderStr(npc->getGender());
+        req.creatureType = CreatureTypeStr(npc->GetCreatureType());
+        req.autoTags = ResolveCreatureAutoTags(npc);
+        req.distance = player->GetDistance(npc);
+        req.playerHealthPct = UnitHealthPct(player);
+        req.npcHealthPct = UnitHealthPct(npc);
+        req.playerInCombat = player->IsInCombat();
+        req.npcInCombat = npc->IsInCombat();
+        req.npcTargetingPlayer = npc->GetVictim() == player;
+        req.isHostile = npc->IsHostileTo(player);
+        req.stance = req.isHostile ? "an enemy" : (npc->IsFriendlyTo(player) ? "a friend" : "a familiar stranger");
+        req.forcePrivateReply = true;
+        if (CreatureTemplate const* tmpl = npc->GetCreatureTemplate())
+        {
+            req.npcSubName = tmpl->SubName;
+            req.rankStr = RankStr(tmpl->rank);
+            req.roleStr = RolesFromNpcFlags(tmpl->npcflag);
+        }
+        if (AreaTableEntry const* zone = sAreaTableStore.LookupEntry(npc->GetZoneId()))
+            req.zoneName = zone->area_name[0];
+        return req;
+    }
+
+    bool TryDispatchNpcHistoryWhisper(Player* player, Creature* npc, std::string* reason = nullptr)
+    {
+        if (!g_HistoryWhispersEnabled || !player || !npc || !npc->IsAlive())
+            return false;
+        if (!player->GetSession() || player->GetSession()->IsBot())
+            return false;
+        if (player->IsInCombat() || npc->IsInCombat())
+        {
+            if (reason) *reason = "player or NPC is in combat";
+            return false;
+        }
+        if (npc->IsHostileTo(player))
+        {
+            if (reason) *reason = "NPC is hostile";
+            return false;
+        }
+        if (!player->IsWithinDist(npc, g_HistoryWhispersTriggerDistance, true))
+        {
+            if (reason) *reason = "NPC is outside history-whisper range";
+            return false;
+        }
+
+        uint64_t playerKey = player->GetGUID().GetRawValue();
+        std::string pairKey = HistoryWhisperPairKey(player, npc);
+        time_t now = std::time(nullptr);
+        if (g_HistoryWhisperPlayerCooldownUntil[playerKey] > now)
+        {
+            if (reason) *reason = "player history-whisper cooldown is active";
+            return false;
+        }
+        if (!pairKey.empty() && g_HistoryWhisperPairCooldownUntil[pairKey] > now)
+        {
+            if (reason) *reason = "player/NPC history-whisper cooldown is active";
+            return false;
+        }
+        if (g_HistoryWhispersChancePct <= 0 ||
+            (g_HistoryWhispersChancePct < 100 && (std::rand() % 100) >= g_HistoryWhispersChancePct))
+        {
+            if (reason) *reason = "history-whisper chance roll did not fire";
+            return false;
+        }
+
+        // Claim cooldown before the worker starts, so a slow API call cannot be queued repeatedly.
+        g_HistoryWhisperPlayerCooldownUntil[playerKey] = now + std::max(1, g_HistoryWhispersPlayerCooldownSec);
+        if (!pairKey.empty())
+            g_HistoryWhisperPairCooldownUntil[pairKey] = now + std::max(1, g_HistoryWhispersPairCooldownSec);
+
+        ChatRequest req = CaptureHistoryWhisperRequest(player, npc);
+        std::thread(NpcHistoryWhisperWorker, std::move(req)).detach();
+        if (reason) *reason = "history-aware whisper queued";
+        return true;
     }
 
     // =======================================================================
@@ -5095,6 +5400,268 @@ namespace
         std::thread(BotWorkerRun, std::move(req)).detach();
     }
 
+    // --- controlled social conversations ----------------------------------------
+    struct BotSocialCfg
+    {
+        bool enable = true;
+        uint32 partyChancePct = 70;
+        uint32 raidChancePct = 35;
+        uint32 guildChancePct = 55;
+        int partyMaxSpeakers = 3;
+        int raidMaxSpeakers = 2;
+        int guildMaxSpeakers = 3;
+        uint32 randomBotChancePct = 25;
+        int cooldownSec = 20;
+    };
+
+    inline BotSocialCfg GetBotSocialCfg()
+    {
+        BotSocialCfg c;
+        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Social.Enable", true);
+        c.partyChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.PartyChancePct", 70));
+        c.raidChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RaidChancePct", 35));
+        c.guildChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.GuildChancePct", 55));
+        c.partyMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.PartyMaxSpeakers", 3)));
+        c.raidMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.RaidMaxSpeakers", 2)));
+        c.guildMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.GuildMaxSpeakers", 3)));
+        c.randomBotChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RandomBotChancePct", 25));
+        c.cooldownSec = std::max(0, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.CooldownSec", 20));
+        return c;
+    }
+
+    inline std::map<std::string, time_t>& BotSocialCooldownUntil()
+    {
+        static std::map<std::string, time_t> m;
+        return m;
+    }
+
+    inline bool BotSocialAmbientAllowed(std::string const& key, int cooldownSec)
+    {
+        time_t now = std::time(nullptr);
+        if (BotSocialCooldownUntil()[key] > now)
+            return false;
+        BotSocialCooldownUntil()[key] = now + std::max(1, cooldownSec);
+        return true;
+    }
+
+    inline bool MessageMentionsBot(std::string const& text, std::string const& botName)
+    {
+        std::string hay = ToLowerCopy(text);
+        std::string needle = ToLowerCopy(botName);
+        if (needle.empty())
+            return false;
+        size_t pos = 0;
+        while ((pos = hay.find(needle, pos)) != std::string::npos)
+        {
+            bool leftOk = pos == 0 || !std::isalnum(static_cast<unsigned char>(hay[pos - 1]));
+            size_t end = pos + needle.size();
+            bool rightOk = end >= hay.size() || !std::isalnum(static_cast<unsigned char>(hay[end]));
+            if (leftOk && rightOk)
+                return true;
+            pos = end;
+        }
+        return false;
+    }
+
+    inline Player* TakeRandomBot(std::vector<Player*>& bots)
+    {
+        if (bots.empty())
+            return nullptr;
+        size_t idx = static_cast<size_t>(std::rand()) % bots.size();
+        Player* p = bots[idx];
+        bots.erase(bots.begin() + idx);
+        return p;
+    }
+
+    inline std::vector<Player*> ChooseSocialBots(std::vector<Player*> candidates, std::string const& text,
+        int maxSpeakers, uint32 randomBotChancePct)
+    {
+        std::vector<Player*> named;
+        std::vector<Player*> alts;
+        std::vector<Player*> randoms;
+        for (Player* bot : candidates)
+        {
+            if (!bot || !IsGenuineBot(bot))
+                continue;
+            if (MessageMentionsBot(text, bot->GetName()))
+                named.push_back(bot);
+            else if (RandomPlayerbotMgr::instance().IsRandomBot(bot))
+                randoms.push_back(bot);
+            else
+                alts.push_back(bot);
+        }
+
+        std::vector<Player*> out;
+        auto addUnique = [&](Player* bot)
+        {
+            if (!bot || static_cast<int>(out.size()) >= maxSpeakers)
+                return;
+            if (std::find(out.begin(), out.end(), bot) == out.end())
+                out.push_back(bot);
+        };
+
+        for (Player* bot : named)
+            addUnique(bot);
+
+        // Prefer at least one non-random alt when available; these are the server owner's
+        // character bots and are the best candidates for authored .card.txt personalities.
+        if (out.empty() && !alts.empty())
+            addUnique(TakeRandomBot(alts));
+
+        // Let a random playerbot occasionally join the banter so a 40-man raid feels populated.
+        if (static_cast<int>(out.size()) < maxSpeakers && !randoms.empty() &&
+            (alts.empty() || (std::rand() % 100) < randomBotChancePct))
+            addUnique(TakeRandomBot(randoms));
+
+        while (static_cast<int>(out.size()) < maxSpeakers && !alts.empty())
+            addUnique(TakeRandomBot(alts));
+        while (static_cast<int>(out.size()) < maxSpeakers && out.empty() && !randoms.empty())
+            addUnique(TakeRandomBot(randoms));
+
+        return out;
+    }
+
+    enum class BotSocialChannel { Party, Raid, Guild };
+    struct BotSocialConversationRequest
+    {
+        uint64_t playerGuidRaw = 0;
+        std::string playerName;
+        BotSocialChannel channel = BotSocialChannel::Party;
+        std::string message;
+        std::string contextHint;
+        std::vector<BotChatRequest> turns;
+    };
+    struct BotSocialReply
+    {
+        uint64_t playerGuidRaw = 0;
+        uint64_t botGuidRaw = 0;
+        BotSocialChannel channel = BotSocialChannel::Party;
+        std::string text;
+    };
+    inline std::queue<BotSocialReply>& BotSocialReplyQueue() { static std::queue<BotSocialReply> q; return q; }
+    inline std::mutex& BotSocialReplyMutex() { static std::mutex m; return m; }
+
+    inline void BotSocialConversationWorker(BotSocialConversationRequest req)
+    {
+        std::string conversation = req.playerName + ": " + req.message;
+        BotCfg const cfg = GetBotCfg();
+
+        for (BotChatRequest turn : req.turns)
+        {
+            std::string historyPath = BotPersonalHistoryFilePath(
+                turn.playerName, turn.playerGuidRaw, turn.botName, turn.botGuidRaw);
+            std::deque<std::string> history;
+            std::string card;
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                EnsureBotChatDirectories();
+                card = LoadBotCharacterCard(turn.botName);
+                history = LoadHistoryTail(historyPath, cfg.historyTail);
+                AppendHistoryLine(historyPath, turn.playerName + ": " + turn.message);
+            }
+
+            card = ExpandBotCharacterCard(turn, std::move(card));
+            std::string system = BuildBotSystemPrompt(turn, card);
+            system += "\n\nYou are participating in a live group conversation. Other characters may already have replied. "
+                "React to what was actually said, stay concise, and do not speak for anyone else.";
+            if (!req.contextHint.empty())
+                system += "\nCurrent situation: " + req.contextHint;
+
+            std::ostringstream user;
+            if (!history.empty())
+            {
+                user << "Your recent history with " << turn.playerName << ":\n";
+                for (std::string const& line : history) user << line << "\n";
+                user << "\n";
+            }
+            user << "Conversation so far:\n" << conversation
+                << "\n\nAdd one short natural line as " << turn.botName
+                << ". If you truly have nothing to add, output exactly [SKIP].";
+
+            NpcChat_LLMResult res = NpcChat_CallLLM(BuildChatApiConfig(), system, user.str());
+            std::string line = TrimCopy(res.text);
+            if (!res.success || line.empty() || ToLowerCopy(line) == "[skip]")
+                continue;
+
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                AppendHistoryLine(historyPath, turn.botName + ": " + line);
+            }
+            conversation += "\n" + turn.botName + ": " + line;
+
+            BotSocialReply reply;
+            reply.playerGuidRaw = req.playerGuidRaw;
+            reply.botGuidRaw = turn.botGuidRaw;
+            reply.channel = req.channel;
+            reply.text = std::move(line);
+            std::lock_guard<std::mutex> lock(BotSocialReplyMutex());
+            BotSocialReplyQueue().push(std::move(reply));
+        }
+    }
+
+    inline void DispatchBotSocialConversation(Player* player, std::vector<Player*> const& bots,
+        BotSocialChannel channel, std::string const& message, std::string const& contextHint)
+    {
+        if (!player || bots.empty())
+            return;
+        BotSocialConversationRequest req;
+        req.playerGuidRaw = player->GetGUID().GetRawValue();
+        req.playerName = player->GetName();
+        req.channel = channel;
+        req.message = message;
+        req.contextHint = contextHint;
+        for (Player* bot : bots)
+        {
+            if (!bot || !IsGenuineBot(bot))
+                continue;
+            BotChatRequest turn;
+            turn.playerGuidRaw = req.playerGuidRaw;
+            turn.playerName = req.playerName;
+            turn.botGuidRaw = bot->GetGUID().GetRawValue();
+            turn.botName = bot->GetName();
+            turn.botLevel = bot->GetLevel();
+            turn.botGender = BotGenderName(bot->getGender());
+            turn.botRace = BotRaceName(bot->getRace());
+            turn.botClass = BotClassName(bot->getClass());
+            turn.channel = channel == BotSocialChannel::Raid ? BotChannel::Raid : BotChannel::Party;
+            turn.message = message;
+            req.turns.push_back(std::move(turn));
+        }
+        if (!req.turns.empty())
+            std::thread(BotSocialConversationWorker, std::move(req)).detach();
+    }
+
+    inline void EmitBotSocialReplies()
+    {
+        std::queue<BotSocialReply> local;
+        {
+            std::lock_guard<std::mutex> lock(BotSocialReplyMutex());
+            if (BotSocialReplyQueue().empty()) return;
+            std::swap(local, BotSocialReplyQueue());
+        }
+        while (!local.empty())
+        {
+            BotSocialReply& r = local.front();
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(r.botGuidRaw));
+            if (bot && bot->IsInWorld())
+            {
+                if (r.channel == BotSocialChannel::Guild)
+                {
+                    if (Guild* guild = bot->GetGuild())
+                        guild->BroadcastToGuild(bot->GetSession(), false, r.text, LANG_UNIVERSAL);
+                }
+                else if (Group* group = bot->GetGroup())
+                {
+                    ChatMsg type = r.channel == BotSocialChannel::Raid ? CHAT_MSG_RAID : CHAT_MSG_PARTY;
+                    WorldPacket data;
+                    ChatHandler::BuildChatPacket(data, type, LANG_UNIVERSAL, bot, bot, r.text);
+                    group->BroadcastPacket(&data, false);
+                }
+            }
+            local.pop();
+        }
+    }
+
     // --- surface entrypoints (called from the PlayerScript hooks) ---------------
 
     // Whisper a bot -> it whispers back. `text` is the already-trimmed message.
@@ -5110,7 +5677,9 @@ namespace
         return true;
     }
 
-    // Name bot(s) in party/raid -> each named genuine bot in the group replies.
+    // Party/raid chat can now feel populated without allowing recursive bot hooks. A real player
+    // message starts one bounded conversation worker; selected bots reply sequentially and later
+    // speakers see the lines produced earlier in the same conversation.
     inline void HandleBotGroup(Player* player, uint32 type, Group* group, std::string const& text)
     {
         BotCfg const cfg = GetBotCfg();
@@ -5118,24 +5687,51 @@ namespace
         if (!IsRealPlayerSession(player)) return;
         if (text.empty() || text[0] == '.') return;
 
-        BotChannel channel;
+        BotSocialChannel socialChannel;
+        BotChannel legacyChannel;
         switch (type)
         {
         case CHAT_MSG_PARTY: case CHAT_MSG_PARTY_LEADER:
-            channel = BotChannel::Party; break;
-        case CHAT_MSG_RAID:  case CHAT_MSG_RAID_LEADER: case CHAT_MSG_RAID_WARNING:
-            channel = BotChannel::Raid;  break;
+            socialChannel = BotSocialChannel::Party; legacyChannel = BotChannel::Party; break;
+        case CHAT_MSG_RAID: case CHAT_MSG_RAID_LEADER: case CHAT_MSG_RAID_WARNING:
+            socialChannel = BotSocialChannel::Raid; legacyChannel = BotChannel::Raid; break;
         default: return;
         }
 
-        std::string lowered = ToLowerCopy(text);
-        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next()) // [AC-API]
+        std::vector<Player*> candidates;
+        bool named = false;
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
         {
             Player* member = itr->GetSource();
             if (!member || member == player || !IsGenuineBot(member)) continue;
-            if (lowered.find(ToLowerCopy(member->GetName())) == std::string::npos) continue;
-            DispatchBot(player, member, channel, text);
+            candidates.push_back(member);
+            named = named || MessageMentionsBot(text, member->GetName());
         }
+        if (candidates.empty()) return;
+
+        BotSocialCfg const social = GetBotSocialCfg();
+        if (!social.enable)
+        {
+            for (Player* bot : candidates)
+                if (MessageMentionsBot(text, bot->GetName()))
+                    DispatchBot(player, bot, legacyChannel, text);
+            return;
+        }
+
+        uint32 chance = socialChannel == BotSocialChannel::Raid ? social.raidChancePct : social.partyChancePct;
+        int maxSpeakers = socialChannel == BotSocialChannel::Raid ? social.raidMaxSpeakers : social.partyMaxSpeakers;
+        if (!named)
+        {
+            if (chance == 0 || (chance < 100 && (std::rand() % 100) >= chance))
+                return;
+            std::string cooldownKey = "group:" + std::to_string(group->GetGUID().GetRawValue());
+            if (!BotSocialAmbientAllowed(cooldownKey, social.cooldownSec))
+                return;
+        }
+
+        std::vector<Player*> chosen = ChooseSocialBots(candidates, text, maxSpeakers, social.randomBotChancePct);
+        DispatchBotSocialConversation(player, chosen, socialChannel, text,
+            socialChannel == BotSocialChannel::Raid ? "This is raid chat in a large adventuring group." : "This is party chat among companions.");
     }
 
     // Target a bot and /say -> it answers. `text` is the already-trimmed message.
@@ -5573,7 +6169,7 @@ namespace
         }
     }
 
-    // --- Guild surface: player-provoked, turn-capped, never initiates ----------
+    // --- Guild surface: controlled multi-bot social conversation ----------------
     inline void HandleBotGuild(Player* player, uint32 /*type*/, Guild* guild, std::string const& text)
     {
         if (!GetBotCfg().enable || !GetSurfaceCfg().guildEnable || !guild) return;
@@ -5581,26 +6177,48 @@ namespace
         if (text.empty() || text[0] == '.') return;
 
         BotSurfaceCfg const cfg = GetSurfaceCfg();
+        BotSocialCfg const social = GetBotSocialCfg();
         uint64_t const playerGuid = player->GetGUID().GetRawValue();
 
-        // Provocation = the player named an online guild bot. Tokenize and look each up by name.
-        std::istringstream iss(text);
-        std::string tok;
-        std::set<std::string> seen;
-        while (iss >> tok)
+        std::vector<Player*> candidates;
+        auto collectOnlineBot = [&](Player* member)
         {
-            // strip trailing punctuation
-            while (!tok.empty() && !std::isalnum((unsigned char)tok.back())) tok.pop_back();
-            if (tok.size() < 2 || seen.count(tok)) continue;
-            seen.insert(tok);
+            if (member && member != player && IsGenuineBot(member) && member->GetGuildId() == player->GetGuildId())
+                candidates.push_back(member);
+        };
+        guild->BroadcastWorker(collectOnlineBot, player);
+        if (candidates.empty()) return;
 
-            Player* bot = ObjectAccessor::FindPlayerByName(tok);   // [AC-API]
-            if (!bot || !IsGenuineBot(bot)) continue;
-            if (bot->GetGuildId() != player->GetGuildId()) continue;
+        bool named = false;
+        for (Player* bot : candidates)
+            named = named || MessageMentionsBot(text, bot->GetName());
 
-            if (GuildTurnAllowed(playerGuid, bot->GetGUID().GetRawValue(), cfg.guildMaxTurns, cfg.guildWindowSec))
-                DispatchBotSurface(player, bot, SurfaceKind::GuildMsg, "", "", text);
+        if (!social.enable)
+        {
+            for (Player* bot : candidates)
+                if (MessageMentionsBot(text, bot->GetName()) &&
+                    GuildTurnAllowed(playerGuid, bot->GetGUID().GetRawValue(), cfg.guildMaxTurns, cfg.guildWindowSec))
+                    DispatchBotSurface(player, bot, SurfaceKind::GuildMsg, "", "", text);
+            return;
         }
+
+        if (!named)
+        {
+            if (social.guildChancePct == 0 ||
+                (social.guildChancePct < 100 && (std::rand() % 100) >= social.guildChancePct))
+                return;
+            std::string cooldownKey = "guild:" + std::to_string(player->GetGuildId());
+            if (!BotSocialAmbientAllowed(cooldownKey, social.cooldownSec))
+                return;
+        }
+
+        std::vector<Player*> chosen = ChooseSocialBots(candidates, text, social.guildMaxSpeakers, social.randomBotChancePct);
+        chosen.erase(std::remove_if(chosen.begin(), chosen.end(), [&](Player* bot)
+            {
+                return !GuildTurnAllowed(playerGuid, bot->GetGUID().GetRawValue(), cfg.guildMaxTurns, cfg.guildWindowSec);
+            }), chosen.end());
+        DispatchBotSocialConversation(player, chosen, BotSocialChannel::Guild, text,
+            "This is guild chat. You are speaking as a guildmate, not as an NPC or assistant.");
     }
 
     // --- Channel surface: General/Trade, LFG matchmaking + optional ambient ----
@@ -5820,6 +6438,7 @@ private:
         uint32 hostileMs = 0;
         uint32 hostileAggroMs = 0;
         uint32 relationshipGreetMs = 0;
+        uint32 historyWhisperMs = 0;
         uint32 trainerMs = 0;
         uint32 questMs = 0;
         uint32 questEnderMs = 0;
@@ -5958,6 +6577,28 @@ private:
                     if (!ok)
                         BarkDebug(player, "relationship greeting skipped for " + std::string(friendNpc->GetName()) + ": " + reason);
                     break; // one greeting per tick
+                }
+            }
+        }
+
+        // A simpler history-based social pass: if the player has genuinely talked to an NPC before,
+        // that nearby non-hostile NPC may privately recognize them without requiring a .barks file.
+        if (g_HistoryWhispersEnabled &&
+            ShouldRunTimer(timers.historyWhisperMs, diff, g_HistoryWhispersScanIntervalMs))
+        {
+            std::vector<uint32> contactEntries = GetPlayerContactEntries(player->GetGUID().GetRawValue(), 64);
+            if (!contactEntries.empty())
+            {
+                std::list<Creature*> nearbyContacts;
+                player->GetCreatureListWithEntryInGrid(nearbyContacts, contactEntries, g_HistoryWhispersTriggerDistance);
+                for (Creature* knownNpc : nearbyContacts)
+                {
+                    if (!knownNpc || !knownNpc->IsInWorld() || !knownNpc->IsAlive() || knownNpc->IsHostileTo(player))
+                        continue;
+                    std::string reason;
+                    if (TryDispatchNpcHistoryWhisper(player, knownNpc, &reason))
+                        break; // at most one API-backed recognition whisper per scan
+                    BarkDebug(player, "history whisper skipped for " + std::string(knownNpc->GetName()) + ": " + reason);
                 }
             }
         }
@@ -6124,6 +6765,10 @@ public:
         LoadConfig();
         EnsureNpcChatDirectoriesAndDefaultPrompt();
         EnsureQuestBarkCacheTable();
+        EnsureNpcContactTable();
+        int importedContacts = ImportNpcContactsFromExistingHistory();
+        if (importedContacts > 0)
+            LOG_INFO("module", "[NpcChat] HistoryWhispers contact index: {} existing personal history file(s) imported.", importedContacts);
     }
 
     void OnUpdate(uint32 diff) override
@@ -6181,7 +6826,11 @@ public:
                 Creature* npc = ObjectAccessor::GetCreature(*anchor, ObjectGuid(r.npcGuidRaw));
                 if (npc && npc->IsInWorld())
                 {
-                    if (r.forcePrivateReply)
+                    if (r.whisper)
+                    {
+                        npc->Whisper(r.text, LANG_UNIVERSAL, anchor);
+                    }
+                    else if (r.forcePrivateReply)
                     {
                         // Targeted creature say: useful for @p private chat and hostile parley at long range.
                         npc->Say(r.text, LANG_UNIVERSAL, anchor);
@@ -6200,6 +6849,7 @@ public:
 
         EmitBotReplies();
         EmitBotSurfaceReplies();
+        EmitBotSocialReplies();
 
         // Cached proximity bark checks run from PlayerScript::OnPlayerAfterUpdate.
         // This branch exposes no sWorld->GetAllSessions() on IWorld, and player hooks
