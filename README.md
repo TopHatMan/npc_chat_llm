@@ -510,3 +510,27 @@ Target NPC
 - Automatic sub-prompt suggestion is not implemented yet.
 - Prompt generation is useful but should still be reviewed by a human.
 - Hostile combat talk is reactive; it is not intended to spam automatic fight barks.
+
+## Stabilized transport and health checks
+
+Direct targeted NPC conversation is the protected baseline. Automatic history whispers, social
+playerbot chatter, guild/LFG surfaces, and generation jobs use lower-priority transport lanes so they
+cannot consume every configured LLM slot. `NpcChat.Api.ReserveInteractiveSlots` controls the reserved
+capacity (default `1` out of `4`).
+
+The transport no longer turns connection/provider failures into unexplained silence. It tracks
+request/success/failure/capacity counters, records the latest safe error, rate-limits repeated log
+messages, and retries only failures that are plausibly transient (transport errors, HTTP 408/425/429,
+and 5xx responses).
+
+Runtime commands:
+
+```text
+.npcc status
+.npcc health
+.npcc health test
+.npcc health reset
+```
+
+`.npcc health test` performs one tiny asynchronous model request and reports the result back in game;
+it never blocks the world thread and never prints the API key or prompt contents to the server log.

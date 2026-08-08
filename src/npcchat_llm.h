@@ -137,6 +137,20 @@ NpcChat_LLMResult NpcChat_CallLLM(const NpcChat_ApiConfig& cfg,
     NpcChat_RequestClass requestClass = NpcChat_RequestClass::Interactive,
     std::string_view label = {});
 
+NpcChat_LLMResult NpcChat_CallBackgroundLLM(const NpcChat_ApiConfig& cfg,
+    const std::string& systemPrompt,
+    const std::string& userPrompt,
+    std::string_view label = "background");
+
+NpcChat_LLMResult NpcChat_CallGenerationLLM(const NpcChat_ApiConfig& cfg,
+    const std::string& systemPrompt,
+    const std::string& userPrompt,
+    std::string_view label = "generation");
+
+NpcChat_LLMResult NpcChat_CallHealthLLM(const NpcChat_ApiConfig& cfg,
+    const std::string& systemPrompt,
+    const std::string& userPrompt);
+
 NpcChat_TransportSnapshot NpcChat_GetTransportSnapshot();
 void NpcChat_ResetTransportStats();
 

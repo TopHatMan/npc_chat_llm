@@ -335,17 +335,11 @@ bool NpcChatTransport::TryAcquire(const NpcChat_ApiConfig& cfg,
 
         if (_inFlightTotal >= allowed)
         {
-            ++_failed;
             ++_rejectedCapacity;
-            _lastError = NpcChat_LLMError::Capacity;
-            _lastHttpStatus = 0;
-            _lastFailureAt = std::time(nullptr);
-            _lastErrorDetail = interactive
+            std::string const detail = interactive
                 ? "all interactive transport slots are busy"
                 : "background/generation capacity reserved for interactive chat";
-            _failureSinceLastSuccess = true;
-
-            rejection = MakeFailure(NpcChat_LLMError::Capacity, _lastErrorDetail);
+            rejection = MakeFailure(NpcChat_LLMError::Capacity, detail);
             return false;
         }
 
@@ -661,4 +655,30 @@ NpcChat_TransportSnapshot NpcChat_GetTransportSnapshot()
 void NpcChat_ResetTransportStats()
 {
     NpcChatTransport::Instance().ResetStats();
+}
+
+NpcChat_LLMResult NpcChat_CallBackgroundLLM(const NpcChat_ApiConfig& cfg,
+    const std::string& systemPrompt,
+    const std::string& userPrompt,
+    std::string_view label)
+{
+    return NpcChatTransport::Instance().Call(cfg, systemPrompt, userPrompt,
+        NpcChat_RequestClass::Background, label);
+}
+
+NpcChat_LLMResult NpcChat_CallGenerationLLM(const NpcChat_ApiConfig& cfg,
+    const std::string& systemPrompt,
+    const std::string& userPrompt,
+    std::string_view label)
+{
+    return NpcChatTransport::Instance().Call(cfg, systemPrompt, userPrompt,
+        NpcChat_RequestClass::Generation, label);
+}
+
+NpcChat_LLMResult NpcChat_CallHealthLLM(const NpcChat_ApiConfig& cfg,
+    const std::string& systemPrompt,
+    const std::string& userPrompt)
+{
+    return NpcChatTransport::Instance().Call(cfg, systemPrompt, userPrompt,
+        NpcChat_RequestClass::HealthCheck, "health-test");
 }

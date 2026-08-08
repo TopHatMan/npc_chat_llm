@@ -22,6 +22,12 @@ NpcChat.RequestTimeoutSec = 30
 NpcChat.ModelExtraParameters =
 NpcChat.Api.VerifyCert = 1
 NpcChat.Api.MaxConcurrentRequests = 4
+# Reserve capacity for direct player-driven NPC/bot chat. Background + generation calls yield first.
+NpcChat.Api.ReserveInteractiveSlots = 1
+# Repeated identical HTTP/provider failures are rate-limited in the worldserver log.
+NpcChat.Api.ErrorLogCooldownSec = 15
+# Direct targeted NPC chat reports a short in-game error instead of failing silently.
+NpcChat.Api.NotifyInteractiveFailures = 1
 
 ###################################################################################################
 # Runtime memory / prompt paths

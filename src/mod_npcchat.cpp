@@ -77,6 +77,9 @@ namespace
     std::string g_ExtraParams;
     bool        g_VerifyCert = true;     // NpcChat.Api.VerifyCert (https only; set 0 for self-signed/local proxy)
     int         g_MaxConcurrent = 4;     // NpcChat.Api.MaxConcurrentRequests (0 = unlimited)
+    int         g_ReserveInteractiveSlots = 1; // keep direct player conversations responsive
+    int         g_ApiErrorLogCooldownSec = 15; // rate-limit repeated identical transport errors
+    bool        g_NotifyInteractiveFailures = true; // visible failure instead of silent NPC chat
 
     // Optional separate API/model for expensive generation jobs.
     // Normal live roleplay uses NpcChat.* above; one-time prompt/bark/quest
@@ -238,7 +241,12 @@ namespace
         g_TimeoutSec = sConfigMgr->GetOption<int32>("NpcChat.RequestTimeoutSec", 30);
         g_ExtraParams = sConfigMgr->GetOption<std::string>("NpcChat.ModelExtraParameters", "");
         g_VerifyCert = sConfigMgr->GetOption<bool>("NpcChat.Api.VerifyCert", true);
-        g_MaxConcurrent = sConfigMgr->GetOption<int32>("NpcChat.Api.MaxConcurrentRequests", 4);
+        g_MaxConcurrent = std::max(0, sConfigMgr->GetOption<int32>("NpcChat.Api.MaxConcurrentRequests", 4));
+        g_ReserveInteractiveSlots = std::max(0, sConfigMgr->GetOption<int32>("NpcChat.Api.ReserveInteractiveSlots", 1));
+        if (g_MaxConcurrent > 0)
+            g_ReserveInteractiveSlots = std::min(g_ReserveInteractiveSlots, g_MaxConcurrent);
+        g_ApiErrorLogCooldownSec = std::max(0, sConfigMgr->GetOption<int32>("NpcChat.Api.ErrorLogCooldownSec", 15));
+        g_NotifyInteractiveFailures = sConfigMgr->GetOption<bool>("NpcChat.Api.NotifyInteractiveFailures", true);
 
         // Backward-compatible generation settings. The old GeneratePrompt* keys still work,
         // while the new NpcChat.Generation.* block can point at a stronger model/API.
@@ -425,6 +433,8 @@ namespace
         cfg.extraParams = g_ExtraParams;
         cfg.verifyCert = g_VerifyCert;
         cfg.maxConcurrent = g_MaxConcurrent;
+        cfg.reserveInteractiveSlots = g_ReserveInteractiveSlots;
+        cfg.errorLogCooldownSec = g_ApiErrorLogCooldownSec;
         return cfg;
     }
 
@@ -440,6 +450,8 @@ namespace
         cfg.extraParams = g_GenerationExtraParams.empty() ? g_ExtraParams : g_GenerationExtraParams;
         cfg.verifyCert = g_VerifyCert;
         cfg.maxConcurrent = g_MaxConcurrent;
+        cfg.reserveInteractiveSlots = g_ReserveInteractiveSlots;
+        cfg.errorLogCooldownSec = g_ApiErrorLogCooldownSec;
         return cfg;
     }
 }
@@ -3443,7 +3455,7 @@ void GeneratePromptWorker(GenPromptRequest req)
 
     NpcChat_ApiConfig cfg = BuildGenerationApiConfig();
 
-    NpcChat_LLMResult res = NpcChat_CallLLM(
+    NpcChat_LLMResult res = NpcChat_CallGenerationLLM(
         cfg,
         BuildGenerateCharacterSystemPrompt(req),
         BuildGenerateCharacterUserPrompt(req, sharedSubPromptNames, sharedSubPrompts, existingSharedPrompt, existingPersonalPrompt));
@@ -3601,7 +3613,7 @@ void GenerateRelationshipBarksWorker(GenBarkRequest req)
 
     NpcChat_ApiConfig cfg = BuildGenerationApiConfig(550);
 
-    NpcChat_LLMResult res = NpcChat_CallLLM(
+    NpcChat_LLMResult res = NpcChat_CallGenerationLLM(
         cfg,
         BuildGenerateRelationshipBarksSystemPrompt(),
         BuildGenerateRelationshipBarksUserPrompt(req, sharedPrompt, personalPrompt, relationshipText, personalHistory, existingBarks));
@@ -3759,7 +3771,7 @@ void GenerateHostileBarkCacheWorker(GenBarkRequest req)
     existingBark = LookupNpcBarkCache(req.npcEntry, req.cacheContext, req.faction, req.playerRace, req.playerClass, req.phase);
 
     NpcChat_ApiConfig cfg = BuildGenerationApiConfig(260);
-    NpcChat_LLMResult res = NpcChat_CallLLM(
+    NpcChat_LLMResult res = NpcChat_CallGenerationLLM(
         cfg,
         BuildGenerateHostileSingleBarkSystemPrompt(),
         BuildGenerateHostileSingleBarkUserPrompt(req, sharedPrompt, sharedSubPrompts, existingBark));
@@ -3843,7 +3855,7 @@ std::string BuildGenerateTrainerSpellBarkUserPrompt(GenBarkRequest const& req)
 void GenerateTrainerSpellBarkCacheWorker(GenBarkRequest req)
 {
     NpcChat_ApiConfig cfg = BuildGenerationApiConfig(220);
-    NpcChat_LLMResult res = NpcChat_CallLLM(
+    NpcChat_LLMResult res = NpcChat_CallGenerationLLM(
         cfg,
         BuildGenerateTrainerSpellBarkSystemPrompt(),
         BuildGenerateTrainerSpellBarkUserPrompt(req));
@@ -3901,7 +3913,7 @@ void GenerateHostileBarksWorker(GenBarkRequest req)
         return;
     }
     NpcChat_ApiConfig cfg = BuildGenerationApiConfig(450);
-    NpcChat_LLMResult res = NpcChat_CallLLM(cfg, BuildGenerateHostileBarksSystemPrompt(), BuildGenerateHostileBarksUserPrompt(req, sharedPrompt, sharedSubPrompts, existingBarks));
+    NpcChat_LLMResult res = NpcChat_CallGenerationLLM(cfg, BuildGenerateHostileBarksSystemPrompt(), BuildGenerateHostileBarksUserPrompt(req, sharedPrompt, sharedSubPrompts, existingBarks));
     if (!res.success || TrimCopy(res.text).empty())
     {
         QueueSystemMessage(req.playerGuidRaw, "NPC Chat hostile bark generation failed or returned empty text.");
@@ -4397,7 +4409,7 @@ namespace
         existingBark = LookupQuestBarkCache(req.npcEntry, req.questKey, req.faction, req.playerRace, req.playerClass, req.phase, req.playerLevel, req.barkType);
         NpcChat_ApiConfig cfg = BuildGenerationApiConfig(350);
         bool isEnder = (req.barkType == "quest_ender");
-        NpcChat_LLMResult res = NpcChat_CallLLM(cfg,
+        NpcChat_LLMResult res = NpcChat_CallGenerationLLM(cfg,
             isEnder ? BuildGenerateQuestEnderBarkSystemPrompt() : BuildGenerateQuestBarkSystemPrompt(),
             BuildGenerateQuestBarkUserPrompt(req, sharedPrompt, existingBark));
         if (!res.success || TrimCopy(res.text).empty())
@@ -4905,7 +4917,7 @@ namespace
             existingBarks = ReadWholeTextFile(req.outputPath);
         }
         NpcChat_ApiConfig cfg = BuildGenerationApiConfig(500);
-        NpcChat_LLMResult res = NpcChat_CallLLM(cfg, BuildGenerateTrainerBarksSystemPrompt(), BuildGenerateTrainerBarksUserPrompt(req, sharedPrompt, existingBarks));
+        NpcChat_LLMResult res = NpcChat_CallGenerationLLM(cfg, BuildGenerateTrainerBarksSystemPrompt(), BuildGenerateTrainerBarksUserPrompt(req, sharedPrompt, existingBarks));
         if (!res.success || TrimCopy(res.text).empty())
         {
             QueueSystemMessage(req.playerGuidRaw, "NPC Chat trainer bark generation failed or returned empty text.");
@@ -4989,10 +5001,16 @@ namespace
         NpcChat_LLMResult res = NpcChat_CallLLM(
             cfg,
             BuildSystemPrompt(req, defaultPrompt, sharedSubPrompts, sharedPrompt, personalSubPrompts, personalPrompt, relationshipText),
-            BuildUserPrompt(req, sharedHistory, personalHistory));
+            BuildUserPrompt(req, sharedHistory, personalHistory),
+            NpcChat_RequestClass::Interactive,
+            "direct-npc");
 
         if (!res.success || res.text.empty())
+        {
+            if (g_NotifyInteractiveFailures)
+                QueueSystemMessage(req.playerGuidRaw, "NPC Chat could not reply: " + NpcChat_FormatFailure(res) + "  Use .npcc health for transport status.");
             return;
+        }
 
         {
             std::lock_guard<std::mutex> lock(g_FileMutex);
@@ -5058,10 +5076,11 @@ namespace
             user << line << "\n";
         user << "\nWhisper as " << req.npcName << ":";
 
-        NpcChat_LLMResult res = NpcChat_CallLLM(
+        NpcChat_LLMResult res = NpcChat_CallBackgroundLLM(
             BuildChatApiConfig(),
             BuildSystemPrompt(req, defaultPrompt, sharedSubPrompts, sharedPrompt, personalSubPrompts, personalPrompt, relationshipText),
-            user.str());
+            user.str(),
+            "history-whisper");
         if (!res.success || TrimCopy(res.text).empty())
             return;
 
@@ -5718,7 +5737,7 @@ namespace
                 << "\n\nAdd one short natural line as " << turn.botName
                 << ". If you truly have nothing to add, output exactly [SKIP].";
 
-            NpcChat_LLMResult res = NpcChat_CallLLM(BuildChatApiConfig(), system, user.str());
+            NpcChat_LLMResult res = NpcChat_CallBackgroundLLM(BuildChatApiConfig(), system, user.str(), "bot-social");
             std::string line = TrimCopy(res.text);
             if (!res.success || line.empty() || ToLowerCopy(line) == "[skip]")
                 continue;
@@ -6231,8 +6250,8 @@ namespace
         if (!req.contextHint.empty())
             systemPrompt += "\n\nCurrent situation:\n" + req.contextHint;
 
-        NpcChat_LLMResult res = NpcChat_CallLLM(
-            BuildChatApiConfig(), systemPrompt, BuildBotUserPrompt(promptReq, history));
+        NpcChat_LLMResult res = NpcChat_CallBackgroundLLM(
+            BuildChatApiConfig(), systemPrompt, BuildBotUserPrompt(promptReq, history), "bot-surface");
         if (!res.success || res.text.empty())
             return;
 
@@ -7137,6 +7156,7 @@ private:
             handler->PSendSysMessage("NPC Chat commands:");
             handler->PSendSysMessage(".npcc key");
             handler->PSendSysMessage(".npcc status");
+            handler->PSendSysMessage(".npcc health [test|reset]");
             handler->PSendSysMessage(".npcc reload");
             handler->PSendSysMessage(".npcc reset");
             handler->PSendSysMessage(".npcc rel");
@@ -7552,6 +7572,62 @@ private:
             return true;
         }
 
+        if (StartsWithWord(arg, "health", rest))
+        {
+            std::string healthRest;
+            if (StartsWithWord(rest, "reset", healthRest))
+            {
+                NpcChat_ResetTransportStats();
+                handler->PSendSysMessage("NPC Chat transport counters reset. In-flight calls are not cancelled.");
+                return true;
+            }
+
+            if (StartsWithWord(rest, "test", healthRest))
+            {
+                Player* player = GetCommandPlayer(handler);
+                if (!player)
+                {
+                    handler->PSendSysMessage(".npcc health test must be run in game.");
+                    return true;
+                }
+
+                NpcChat_ApiConfig cfg = BuildChatApiConfig();
+                cfg.maxTokens = 8;
+                cfg.temperature = 0.0;
+                uint64_t const playerGuidRaw = player->GetGUID().GetRawValue();
+                handler->PSendSysMessage("NPC Chat API health test queued; it runs off the world thread.");
+                std::thread([playerGuidRaw, cfg]()
+                    {
+                        NpcChat_LLMResult res = NpcChat_CallHealthLLM(
+                            cfg,
+                            "You are a transport health check. Follow the user instruction exactly.",
+                            "Reply with exactly: OK");
+                        if (res.success)
+                            QueueSystemMessage(playerGuidRaw, "NPC Chat API health test OK: provider/model returned a valid response.");
+                        else
+                            QueueSystemMessage(playerGuidRaw, "NPC Chat API health test FAILED: " + NpcChat_FormatFailure(res));
+                    }).detach();
+                return true;
+            }
+
+            NpcChat_TransportSnapshot const snapshot = NpcChat_GetTransportSnapshot();
+            handler->PSendSysMessage("NPC Chat transport health:");
+            handler->PSendSysMessage("  requests={} success={} failed={} capacityRejected={}",
+                snapshot.totalRequests, snapshot.succeeded, snapshot.failed, snapshot.rejectedCapacity);
+            handler->PSendSysMessage("  inFlight={} interactive={} background={} generation={}",
+                snapshot.inFlightTotal, snapshot.inFlightInteractive, snapshot.inFlightBackground, snapshot.inFlightGeneration);
+            handler->PSendSysMessage("  admission: maxConcurrent={} reservedInteractive={}",
+                g_MaxConcurrent, g_ReserveInteractiveSlots);
+            if (snapshot.lastError == NpcChat_LLMError::None)
+                handler->PSendSysMessage("  last failure: (none recorded)");
+            else
+                handler->PSendSysMessage("  last failure: {} HTTP={} {}",
+                    NpcChat_LLMErrorName(snapshot.lastError), snapshot.lastHttpStatus,
+                    snapshot.lastErrorDetail.empty() ? "" : snapshot.lastErrorDetail.c_str());
+            handler->PSendSysMessage("  active test: .npcc health test");
+            return true;
+        }
+
         if (StartsWithWord(arg, "status", rest))
         {
             std::vector<std::string> const keys = LoadedNpcChatConfigKeys();
@@ -7561,6 +7637,8 @@ private:
             handler->PSendSysMessage("  BaseUrl: {}", g_BaseUrl.empty() ? "(missing)" : g_BaseUrl.c_str());
             handler->PSendSysMessage("  Model: {}", g_Model.empty() ? "(missing)" : g_Model.c_str());
             handler->PSendSysMessage("  ApiKey: {}", g_ApiKey.empty() ? "missing" : "set");
+            handler->PSendSysMessage("  API concurrency: max={} reservedInteractive={} notifyInteractiveFailures={}",
+                g_MaxConcurrent, g_ReserveInteractiveSlots, g_NotifyInteractiveFailures ? "1" : "0");
             handler->PSendSysMessage("  Config path: {}", sConfigMgr->GetConfigPath().c_str());
             if (keys.empty())
                 handler->PSendSysMessage("  ERROR: no NpcChat.* options are loaded. Check the deployed module config under the runtime config path/modules directory.");
