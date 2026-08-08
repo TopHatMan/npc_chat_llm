@@ -73,6 +73,22 @@ NpcChat.Bot.HistoryMaxLines = 20
 
 There is no narrator memory condensation, relationship scoring, vector database, or separate personal character card in this playerbot system.
 
+## Addon traffic is not roleplay
+
+WoW addons communicate through chat packets marked with AzerothCore's `LANG_ADDON`. Those packets can use whisper, party, raid, guild, or channel transport even though they are not human dialogue.
+
+`npc_chat_llm` ignores `LANG_ADDON` traffic **before** any NPC/playerbot RP handler runs. Addon packets therefore:
+
+- do not trigger a playerbot whisper reply
+- do not start party/raid/guild social generation
+- do not trigger NPC chat
+- do not consume an LLM request
+- do not get appended to new RP history
+
+The bot system prompt also explicitly treats addon/protocol payloads as non-dialogue. This second layer is intentional: older history files may already contain addon garbage from builds before the hard filter existed, and the model should ignore rather than roleplay about those lines.
+
+For direct whispers, the intended behavior is simple: **the real player whispers first, then the bot may whisper back.** `npc_chat_llm` does not use addon traffic as permission to initiate an RP whisper.
+
 ## Chat surfaces
 
 The same card and recent-history prompt path is used for:
@@ -114,7 +130,6 @@ NpcChat.Bot.Social.CooldownSec = 20
 
 Named bot messages bypass the ambient chance roll. Ambient conversations use the chance and cooldown settings.
 
-
 ## Keeping guild bots online
 
 `NpcChat.Bot.GuildPresence.Enable = 1` makes guild presence follow the **real players** in that guild. While at least one real guild member is online, `npc_chat_llm` periodically scans the guild roster and asks Playerbots to log in eligible offline guild bots.
@@ -139,10 +154,12 @@ The module does **not** force guild bots to log out when the last real guild mem
 3. Confirm the bot replies without a second card-generation LLM request.
 4. Edit the new card with a very obvious personality or phrase and save it.
 5. Talk to the bot again and confirm the next reply reflects the edit without restarting or reloading.
-6. Put several playerbots in a party and send a normal party message; confirm only a bounded set replies.
-7. Repeat in raid chat and confirm the raid speaker cap is respected.
-8. Log in a real guild member with several eligible guild bots offline; within the configured scans, confirm those bot characters appear online in the guild roster.
-9. Confirm an ordinary non-bot alt in the same guild remains offline.
-10. Send a guild message after the bots have logged in and confirm a small multi-bot conversation can occur.
-11. Name one specific bot and confirm it is favored as a speaker.
-12. Confirm recent bot history remains under `NpcChat.HistoryPath/bots/personal/` and no GUID-based `.card` files are created.
+6. With an addon that communicates through addon whispers enabled, confirm those packets no longer produce RP replies or new bot-history lines.
+7. Manually whisper the bot afterward and confirm it still answers normally.
+8. Put several playerbots in a party and send a normal party message; confirm only a bounded set replies.
+9. Repeat in raid chat and confirm the raid speaker cap is respected.
+10. Log in a real guild member with several eligible guild bots offline; within the configured scans, confirm those bot characters appear online in the guild roster.
+11. Confirm an ordinary non-bot alt in the same guild remains offline.
+12. Send a guild message after the bots have logged in and confirm a small multi-bot conversation can occur.
+13. Name one specific bot and confirm it is favored as a speaker.
+14. Confirm recent bot history remains under `NpcChat.HistoryPath/bots/personal/` and no GUID-based `.card` files are created.
