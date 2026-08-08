@@ -19,7 +19,9 @@ jobs:
         with:
           ref: agent/fix-npcchat-config-runtime
       - name: Apply patch
-        run: python scripts/apply_config_runtime_fix.py
+        run: |
+          sed -i 's/GuildPresenceNextScanByGuild()/GuildPresenceNextScan()/g' scripts/apply_config_runtime_fix.py
+          python scripts/apply_config_runtime_fix.py
       - name: Validate and commit
         run: |
           git config user.name "TopHatMan"
