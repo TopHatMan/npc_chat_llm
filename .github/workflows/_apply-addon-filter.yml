@@ -1,0 +1,57 @@
+name: Apply addon RP filter patch
+
+on:
+  push:
+    branches:
+      - agent/tune-whispers-and-guild-chatter
+    paths:
+      - scripts/_apply_addon_filter_patch.py
+      - .github/workflows/_apply-addon-filter.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/tune-whispers-and-guild-chatter
+          fetch-depth: 0
+
+      - name: Apply addon filter
+        run: python scripts/_apply_addon_filter_patch.py
+
+      - name: Validate addon invariants
+        run: |
+          python scripts/validate_config_contract.py
+          python - <<'PY'
+          from pathlib import Path
+          cpp = Path('src/mod_npcchat.cpp').read_text()
+          checks = {
+              'LANG_ADDON hard filter exists': 'static_cast<uint32>(LANG_ADDON)' in cpp,
+              'private chat filtered before bot handler': 'if (IsAddonTraffic(lang))\n            return true;\n        HandleBotWhisper' in cpp,
+              'group addon traffic filtered': 'HandleBotGroup(player, type, group' in cpp and cpp.count('if (IsAddonTraffic(lang))') >= 5,
+              'prompt ignores addon protocol history': 'Ignore addon/protocol traffic completely' in cpp,
+              'prompt never roleplays protocol': 'never mention, interpret, answer, or roleplay about them' in cpp,
+          }
+          failed = [name for name, ok in checks.items() if not ok]
+          for name, ok in checks.items():
+              print(('OK   ' if ok else 'FAIL ') + name)
+          if failed:
+              raise SystemExit('failed addon invariants: ' + ', '.join(failed))
+          PY
+          git diff --check
+
+      - name: Commit source patch
+        run: |
+          git config user.name "TopHatMan"
+          git config user.email "36683809+TopHatMan@users.noreply.github.com"
+          git add src/mod_npcchat.cpp
+          if git diff --cached --quiet; then
+            echo "No source changes"
+            exit 0
+          fi
+          git commit -m "Ignore addon protocol traffic in RP chat"
+          git push origin HEAD:agent/tune-whispers-and-guild-chatter
