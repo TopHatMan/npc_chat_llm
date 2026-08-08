@@ -248,9 +248,9 @@ namespace
         g_GenerationExtraParams = sConfigMgr->GetOption<std::string>("NpcChat.Generation.ModelExtraParameters", g_ExtraParams);
         g_GenerationTimeoutSec = sConfigMgr->GetOption<int32>("NpcChat.Generation.RequestTimeoutSec", g_TimeoutSec);
         g_GeneratePromptMaxTokens = sConfigMgr->GetOption<int32>("NpcChat.Generation.MaxTokens",
-            sConfigMgr->GetOption<int32>("NpcChat.GeneratePromptMaxTokens", 700));
+            sConfigMgr->GetOption<int32>("NpcChat.GeneratePromptMaxTokens", 700, false));
         g_GeneratePromptTemperature = sConfigMgr->GetOption<float>("NpcChat.Generation.Temperature",
-            sConfigMgr->GetOption<float>("NpcChat.GeneratePromptTemperature", 0.75f));
+            sConfigMgr->GetOption<float>("NpcChat.GeneratePromptTemperature", 0.75f, false));
 
         g_HistoryPath = sConfigMgr->GetOption<std::string>("NpcChat.HistoryPath", "./AI_RP/npc_history");
         g_HistoryTail = sConfigMgr->GetOption<int32>("NpcChat.HistoryMaxLines", 20);
@@ -292,9 +292,9 @@ namespace
             };
 
         mergeAccountIds(g_SubPromptCreatorAccounts, ParseAccountIdList(
-            sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccountIds", "")));
+            sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccountIds", "", false)));
         mergeAccountIds(g_SubPromptCreatorAccounts, ParseAccountIdList(
-            sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccountIDs", "")));
+            sConfigMgr->GetOption<std::string>("NpcChat.SubPromptCreatorAccountIDs", "", false)));
 
         g_RelationshipBarksEnabled = sConfigMgr->GetOption<bool>("NpcChat.RelationshipBarks.Enabled", false);
         g_RelationshipBarksRealPlayersOnly = sConfigMgr->GetOption<bool>("NpcChat.RelationshipBarks.RealPlayersOnly", true);
@@ -378,6 +378,39 @@ namespace
             g_QuestBarksScanIntervalMs = 1000;
         if (g_QuestBarksMaxQuestsCheckedPerNpc < 1)
             g_QuestBarksMaxQuestsCheckedPerNpc = 1;
+    }
+
+    std::vector<std::string> LoadedNpcChatConfigKeys()
+    {
+        try
+        {
+            return sConfigMgr->GetKeysByString("NpcChat.");
+        }
+        catch (...)
+        {
+            return {};
+        }
+    }
+
+    void LogNpcChatConfigState(char const* context)
+    {
+        std::vector<std::string> const keys = LoadedNpcChatConfigKeys();
+        if (keys.empty())
+        {
+            LOG_ERROR("module", "[NpcChat] {}: ConfigMgr has ZERO loaded NpcChat.* keys. The runtime module config is not being loaded. Check the deployed modules config directory, not only the source .conf.dist file.", context);
+            return;
+        }
+
+        LOG_INFO("module", "[NpcChat] {}: loaded {} NpcChat.* key(s); enabled={}; baseUrl='{}'; model='{}'; apiKey={}",
+            context, keys.size(), g_Enable ? "yes" : "no", g_BaseUrl,
+            g_Model.empty() ? "(missing)" : g_Model, g_ApiKey.empty() ? "missing" : "set");
+
+        if (!g_Enable)
+            LOG_ERROR("module", "[NpcChat] {}: NpcChat.Enable resolved to 0. All NPC/playerbot LLM chat is disabled.", context);
+        if (g_BaseUrl.empty())
+            LOG_ERROR("module", "[NpcChat] {}: NpcChat.BaseUrl resolved empty. LLM requests cannot be sent.", context);
+        if (g_Model.empty())
+            LOG_ERROR("module", "[NpcChat] {}: NpcChat.Model resolved empty. LLM requests will not produce usable replies.", context);
     }
 
     NpcChat_ApiConfig BuildChatApiConfig()
@@ -5166,14 +5199,14 @@ namespace
     inline BotCfg GetBotCfg()
     {
         BotCfg cfg;
-        cfg.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Enable", false);
-        cfg.replyWhisper = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyWhisper", true);
-        cfg.replyPartyRaid = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyPartyRaid", true);
-        cfg.replyTarget = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyTarget", true);
-        cfg.triggerRange = sConfigMgr->GetOption<float>("NpcChat.Bot.TriggerRange", 25.0f);
-        cfg.historyTail = sConfigMgr->GetOption<int32>("NpcChat.Bot.HistoryMaxLines", 20);
+        cfg.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Enable", false, false);
+        cfg.replyWhisper = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyWhisper", true, false);
+        cfg.replyPartyRaid = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyPartyRaid", true, false);
+        cfg.replyTarget = sConfigMgr->GetOption<bool>("NpcChat.Bot.ReplyTarget", true, false);
+        cfg.triggerRange = sConfigMgr->GetOption<float>("NpcChat.Bot.TriggerRange", 25.0f, false);
+        cfg.historyTail = sConfigMgr->GetOption<int32>("NpcChat.Bot.HistoryMaxLines", 20, false);
         cfg.characterCardsPath = sConfigMgr->GetOption<std::string>(
-            "NpcChat.Bot.CharacterCardsPath", "./characters");
+            "NpcChat.Bot.CharacterCardsPath", "./characters", false);
         return cfg;
     }
 
@@ -5194,13 +5227,13 @@ namespace
     inline GuildPresenceCfg GetGuildPresenceCfg()
     {
         GuildPresenceCfg cfg;
-        cfg.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.GuildPresence.Enable", true);
+        cfg.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.GuildPresence.Enable", true, false);
         cfg.scanIntervalSec = std::max<uint32>(1,
-            sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildPresence.ScanIntervalSec", 10));
+            sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildPresence.ScanIntervalSec", 10, false));
         cfg.maxLoginsPerScan = sConfigMgr->GetOption<uint32>(
-            "NpcChat.Bot.GuildPresence.MaxLoginsPerScan", 20);
+            "NpcChat.Bot.GuildPresence.MaxLoginsPerScan", 20, false);
         cfg.includeAddClass = sConfigMgr->GetOption<bool>(
-            "NpcChat.Bot.GuildPresence.IncludeAddClass", true);
+            "NpcChat.Bot.GuildPresence.IncludeAddClass", true, false);
         return cfg;
     }
 
@@ -5524,15 +5557,15 @@ namespace
     inline BotSocialCfg GetBotSocialCfg()
     {
         BotSocialCfg c;
-        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Social.Enable", true);
-        c.partyChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.PartyChancePct", 70));
-        c.raidChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RaidChancePct", 35));
-        c.guildChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.GuildChancePct", 55));
-        c.partyMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.PartyMaxSpeakers", 3)));
-        c.raidMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.RaidMaxSpeakers", 2)));
-        c.guildMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.GuildMaxSpeakers", 3)));
-        c.randomBotChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RandomBotChancePct", 25));
-        c.cooldownSec = std::max(0, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.CooldownSec", 20));
+        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Social.Enable", true, false);
+        c.partyChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.PartyChancePct", 70, false));
+        c.raidChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RaidChancePct", 35, false));
+        c.guildChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.GuildChancePct", 55, false));
+        c.partyMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.PartyMaxSpeakers", 3, false)));
+        c.raidMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.RaidMaxSpeakers", 2, false)));
+        c.guildMaxSpeakers = std::max(1, std::min(4, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.GuildMaxSpeakers", 3, false)));
+        c.randomBotChancePct = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("NpcChat.Bot.Social.RandomBotChancePct", 25, false));
+        c.cooldownSec = std::max(0, sConfigMgr->GetOption<int32>("NpcChat.Bot.Social.CooldownSec", 20, false));
         return c;
     }
 
@@ -6125,14 +6158,14 @@ namespace
     inline BotSurfaceCfg GetSurfaceCfg()
     {
         BotSurfaceCfg c;
-        c.lfgEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Enable", true);
-        c.levelBracket = sConfigMgr->GetOption<int32>("NpcChat.Bot.Lfg.LevelBracket", 8);
-        c.lfgGeneral = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.General", true);
-        c.lfgTrade = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Trade", false);
-        c.ambientChance = sConfigMgr->GetOption<uint32>("NpcChat.Bot.General.Chance", 0);
-        c.guildEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Guild.Enable", true);
-        c.guildMaxTurns = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.MaxTurns", 4);
-        c.guildWindowSec = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.WindowSec", 300);
+        c.lfgEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Enable", true, false);
+        c.levelBracket = sConfigMgr->GetOption<int32>("NpcChat.Bot.Lfg.LevelBracket", 8, false);
+        c.lfgGeneral = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.General", true, false);
+        c.lfgTrade = sConfigMgr->GetOption<bool>("NpcChat.Bot.Lfg.Trade", false, false);
+        c.ambientChance = sConfigMgr->GetOption<uint32>("NpcChat.Bot.General.Chance", 0, false);
+        c.guildEnable = sConfigMgr->GetOption<bool>("NpcChat.Bot.Guild.Enable", true, false);
+        c.guildMaxTurns = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.MaxTurns", 4, false);
+        c.guildWindowSec = sConfigMgr->GetOption<int32>("NpcChat.Bot.Guild.WindowSec", 300, false);
         return c;
     }
 
@@ -6877,6 +6910,7 @@ public:
     void OnStartup() override
     {
         LoadConfig();
+        LogNpcChatConfigState("startup");
         EnsureNpcChatDirectoriesAndDefaultPrompt();
         EnsureQuestBarkCacheTable();
         EnsureNpcContactTable();
@@ -7102,6 +7136,7 @@ private:
         {
             handler->PSendSysMessage("NPC Chat commands:");
             handler->PSendSysMessage(".npcc key");
+            handler->PSendSysMessage(".npcc status");
             handler->PSendSysMessage(".npcc reload");
             handler->PSendSysMessage(".npcc reset");
             handler->PSendSysMessage(".npcc rel");
@@ -7517,12 +7552,38 @@ private:
             return true;
         }
 
+        if (StartsWithWord(arg, "status", rest))
+        {
+            std::vector<std::string> const keys = LoadedNpcChatConfigKeys();
+            handler->PSendSysMessage("NPC Chat effective runtime status:");
+            handler->PSendSysMessage("  loaded NpcChat.* keys: {}", keys.size());
+            handler->PSendSysMessage("  NpcChat.Enable: {}", g_Enable ? "1" : "0");
+            handler->PSendSysMessage("  BaseUrl: {}", g_BaseUrl.empty() ? "(missing)" : g_BaseUrl.c_str());
+            handler->PSendSysMessage("  Model: {}", g_Model.empty() ? "(missing)" : g_Model.c_str());
+            handler->PSendSysMessage("  ApiKey: {}", g_ApiKey.empty() ? "missing" : "set");
+            handler->PSendSysMessage("  Config path: {}", sConfigMgr->GetConfigPath().c_str());
+            if (keys.empty())
+                handler->PSendSysMessage("  ERROR: no NpcChat.* options are loaded. Check the deployed module config under the runtime config path/modules directory.");
+            else if (!g_Enable || g_Model.empty() || g_BaseUrl.empty())
+                handler->PSendSysMessage("  ERROR: live NPC chat cannot work with the effective values above.");
+            return true;
+        }
+
         if (StartsWithWord(arg, "reload", rest))
         {
+            bool const moduleConfigsReloaded = sConfigMgr->LoadModulesConfigs(true, true);
             LoadConfig();
-            std::lock_guard<std::mutex> lock(g_FileMutex);
-            EnsureNpcChatDirectoriesAndDefaultPrompt();
-            handler->PSendSysMessage("NPC Chat config and prompt paths reloaded.");
+            LogNpcChatConfigState(".npcc reload");
+            {
+                std::lock_guard<std::mutex> lock(g_FileMutex);
+                EnsureNpcChatDirectoriesAndDefaultPrompt();
+            }
+            handler->PSendSysMessage("NPC Chat module config files reread from disk: {}", moduleConfigsReloaded ? "yes" : "NO");
+            handler->PSendSysMessage("Effective: Enable={} Model={} ApiKey={} NpcChatKeys={}",
+                g_Enable ? "1" : "0", g_Model.empty() ? "(missing)" : g_Model.c_str(),
+                g_ApiKey.empty() ? "missing" : "set", LoadedNpcChatConfigKeys().size());
+            if (!moduleConfigsReloaded)
+                handler->PSendSysMessage("Config reload failed. Check the runtime modules config directory and worldserver log.");
             return true;
         }
 

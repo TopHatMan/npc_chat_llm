@@ -1,13 +1,17 @@
 ###################################################################################################
-# NPC Chat LLM - current combined feature config
-# Safe defaults: all proximity/automatic bark systems are OFF.
-# Manual .npcc commands still work when NpcChat.Enable = 1.
+# NPC Chat LLM - canonical runtime configuration
+#
+# IMPORTANT:
+# - This .conf.dist is the source template. AzerothCore normally runs from a deployed module config
+#   under the server runtime config path/modules directory.
+# - Do not keep duplicate NpcChat.* keys in the runtime file. One key = one effective value.
+# - `.npcc status` shows what ConfigMgr actually loaded.
+# - `.npcc reload` now rereads module config files from disk before reloading NPC Chat values.
 ###################################################################################################
 
 ###################################################################################################
 # Main live NPC chat model
 ###################################################################################################
-
 NpcChat.Enable = 1
 NpcChat.BaseUrl =
 NpcChat.ApiKey =
@@ -16,39 +20,24 @@ NpcChat.MaxResponseTokens = 180
 NpcChat.Temperature = 0.85
 NpcChat.RequestTimeoutSec = 30
 NpcChat.ModelExtraParameters =
+NpcChat.Api.VerifyCert = 1
+NpcChat.Api.MaxConcurrentRequests = 4
 
+###################################################################################################
+# Runtime memory / prompt paths
+###################################################################################################
 NpcChat.HistoryPath = ./AI_RP/npc_history
 NpcChat.HistoryMaxLines = 20
 NpcChat.SharedHistoryMaxLines = 12
 NpcChat.PersonalHistoryMaxLines = 20
 NpcChat.NameByEntry = 1
 
+###################################################################################################
+# Direct targeted NPC chat
+###################################################################################################
 NpcChat.TriggerRange = 25.0
 NpcChat.RequirePrefix = 0
 NpcChat.Prefix = !
-
-###################################################################################################
-# Advanced generation model
-# Blank values fall back to the normal NpcChat.* API/model.
-# Use this for .npcc gen shared/personal/bark/quest if you want a stronger model.
-###################################################################################################
-
-NpcChat.Generation.BaseUrl =
-NpcChat.Generation.ApiKey =
-NpcChat.Generation.Model =
-NpcChat.Generation.MaxTokens = 700
-NpcChat.Generation.Temperature = 0.75
-NpcChat.Generation.RequestTimeoutSec = 60
-NpcChat.Generation.ModelExtraParameters =
-
-# Legacy aliases still accepted by the code if present.
-NpcChat.GeneratePromptMaxTokens = 700
-NpcChat.GeneratePromptTemperature = 0.75
-
-###################################################################################################
-# Hostile NPC chat while directly spoken to
-###################################################################################################
-
 NpcChat.AllowHostileChat = 1
 NpcChat.HostileAllowCloseChat = 1
 NpcChat.HostileAllowCombatChat = 1
@@ -57,20 +46,39 @@ NpcChat.HostileMaxDistance = 100.0
 NpcChat.HostileForcePrivateReply = 0
 
 ###################################################################################################
-# Trusted non-GM worldbuilder accounts
-# Put account IDs here, comma-separated.
+# Untargeted /say and /yell
 ###################################################################################################
+NpcChat.UntargetedChat.Enable = 1
+NpcChat.UntargetedChat.YellRange = 50
+NpcChat.UntargetedChat.HostileYell = 1
 
+###################################################################################################
+# Optional separate generation model. Blank endpoint/key/model values fall back to live-chat values.
+# Old GeneratePrompt* aliases remain accepted by code but are intentionally not duplicated here.
+###################################################################################################
+NpcChat.Generation.BaseUrl =
+NpcChat.Generation.ApiKey =
+NpcChat.Generation.Model =
+NpcChat.Generation.MaxTokens = 700
+NpcChat.Generation.Temperature = 0.75
+NpcChat.Generation.RequestTimeoutSec = 60
+NpcChat.Generation.ModelExtraParameters =
+
+###################################################################################################
+# Trusted non-GM worldbuilder account IDs, comma-separated
+###################################################################################################
 NpcChat.SubPromptCreatorAccounts =
-NpcChat.SubPromptCreatorAccountIds =
-NpcChat.SubPromptCreatorAccountIDs =
+NpcChat.SubPrompt.ImportOnStartup = 1
+
+###################################################################################################
+# Diagnostics
+###################################################################################################
+NpcChat.BarkDebug = 0
+NpcChat.BarkDebugCooldownSec = 15
 
 ###################################################################################################
 # Cached relationship barks
-# Uses personal .relationship and .barks files.
-# Proximity never calls the AI when GenerateMissing = 0.
 ###################################################################################################
-
 NpcChat.RelationshipBarks.Enabled = 0
 NpcChat.RelationshipBarks.RealPlayersOnly = 1
 NpcChat.RelationshipBarks.TriggerDistance = 12.0
@@ -82,11 +90,7 @@ NpcChat.RelationshipBarks.ScanIntervalMs = 2000
 NpcChat.RelationshipBarks.GenerateMissing = 0
 
 ###################################################################################################
-# HISTORY-AWARE NPC WHISPERS
-#
-# Once a real player has actually talked to an NPC, the module records a lightweight contact index.
-# When that NPC is nearby later, it may use the existing personal chat history to privately whisper
-# a short recognition/follow-up line. This is a normal LLM call, so chance and cooldowns are conservative.
+# History-aware familiar NPC whispers
 ###################################################################################################
 NpcChat.HistoryWhispers.Enabled = 1
 NpcChat.HistoryWhispers.TriggerDistance = 18.0
@@ -97,29 +101,24 @@ NpcChat.HistoryWhispers.ScanIntervalMs = 5000
 NpcChat.HistoryWhispers.HistoryMaxLines = 8
 
 ###################################################################################################
-# Cached hostile elite first-talk barks
-# Uses shared .hostile_barks files.
-# Safe first version checks selected hostile NPC only, not full nearby grid scan.
+# Hostile first-talk
+# Preserves the most recent testing behavior from the old duplicated config.
 ###################################################################################################
-
-NpcChat.HostileFirstTalk.Enabled = 0
+NpcChat.HostileFirstTalk.Enabled = 1
 NpcChat.HostileFirstTalk.RealPlayersOnly = 1
 NpcChat.HostileFirstTalk.TriggerDistance = 35.0
-NpcChat.HostileFirstTalk.ChancePct = 20
-NpcChat.HostileFirstTalk.PlayerCooldownSec = 900
-NpcChat.HostileFirstTalk.NpcCooldownSec = 900
-NpcChat.HostileFirstTalk.PairCooldownSec = 1800
-NpcChat.HostileFirstTalk.ScanIntervalMs = 2000
-NpcChat.HostileFirstTalk.GenerateMissing = 0
+NpcChat.HostileFirstTalk.ChancePct = 100
+NpcChat.HostileFirstTalk.PlayerCooldownSec = 60
+NpcChat.HostileFirstTalk.NpcCooldownSec = 60
+NpcChat.HostileFirstTalk.PairCooldownSec = 120
+NpcChat.HostileFirstTalk.ScanIntervalMs = 3000
+NpcChat.HostileFirstTalk.GenerateMissing = 1
 NpcChat.HostileFirstTalk.ElitesOnly = 1
 NpcChat.HostileFirstTalk.AllowInCombat = 0
 
 ###################################################################################################
-# Cached trainer barks
-# Uses shared .trainer_barks files.
-# First pass checks trainer flag. Later pass should check same class/trainable spells.
+# Trainer barks
 ###################################################################################################
-
 NpcChat.TrainerBarks.Enabled = 0
 NpcChat.TrainerBarks.RealPlayersOnly = 1
 NpcChat.TrainerBarks.TriggerDistance = 12.0
@@ -131,34 +130,8 @@ NpcChat.TrainerBarks.ScanIntervalMs = 3000
 NpcChat.TrainerBarks.GenerateMissing = 0
 
 ###################################################################################################
-# Cached quest barks
-# Uses npcchat_quest_bark_cache world table.
-# First pass checks selected questgiver only, not full nearby grid scan.
-# GenerateMissing = 0 means proximity never spends API tokens.
+# Quest / quest-ender barks
 ###################################################################################################
-
-NpcChat.QuestBarks.Enabled = 0
-NpcChat.QuestBarks.RealPlayersOnly = 1
-NpcChat.QuestBarks.GenerateMissing = 0
-NpcChat.QuestBarks.TriggerDistance = 12.0
-NpcChat.QuestBarks.ChancePct = 10
-NpcChat.QuestBarks.PlayerCooldownSec = 900
-NpcChat.QuestBarks.NpcCooldownSec = 300
-NpcChat.QuestBarks.PairCooldownSec = 1800
-NpcChat.QuestBarks.ScanIntervalMs = 3000
-NpcChat.QuestBarks.MaxQuestsCheckedPerNpc = 8
-
-
-###################################################################################################
-# NPC Chat LLM - quest bark nearby scan additions
-#
-# SelectedOnly = 1 keeps old safest behavior: quest bark checks selected questgiver only.
-# SelectedOnly = 0 enables the new DB-assisted nearby questgiver scan.
-#
-# GenerateMissing = 0 means walking near a questgiver never spends API tokens unless a cached bark
-# already exists. Set GenerateMissing = 1 only after manual testing.
-###################################################################################################
-
 NpcChat.QuestBarks.Enabled = 0
 NpcChat.QuestBarks.SelectedOnly = 1
 NpcChat.QuestBarks.RealPlayersOnly = 1
@@ -172,127 +145,18 @@ NpcChat.QuestBarks.ScanIntervalMs = 3000
 NpcChat.QuestBarks.MaxQuestsCheckedPerNpc = 8
 
 ###################################################################################################
-# NPC Chat LLM - Hostile first-talk SQL cache with disable table
+# Playerbot direct chat / character cards
 ###################################################################################################
-
-NpcChat.HostileFirstTalk.Enabled = 1
-NpcChat.HostileFirstTalk.GenerateMissing = 1
-
-# Keep this as intro-only, not combat chatter.
-NpcChat.HostileFirstTalk.AllowInCombat = 0
-
-# Good testing values; raise cooldowns/lower chance after testing.
-NpcChat.HostileFirstTalk.ChancePct = 100
-NpcChat.HostileFirstTalk.TriggerDistance = 35.0
-NpcChat.HostileFirstTalk.ScanIntervalMs = 3000
-NpcChat.HostileFirstTalk.PlayerCooldownSec = 60
-NpcChat.HostileFirstTalk.NpcCooldownSec = 60
-NpcChat.HostileFirstTalk.PairCooldownSec = 120
-
-# Bosses/elite-only keeps it focused. Specific NPCs can also be disabled in SQL:
-# REPLACE INTO npcchat_npc_bark_disable (npc_entry,bark_context,disabled,reason)
-# VALUES (639,'hostile_first_talk',1,'Already has scripted boss dialogue');
-NpcChat.HostileFirstTalk.ElitesOnly = 1
-# NPC Chat generation lorebook / auto subprompt injection
-#
-# Folder layout:
-#   <NpcChat.HistoryPath>/default.prompt
-#   <NpcChat.HistoryPath>/personal/
-#   <NpcChat.HistoryPath>/shared/
-#   <NpcChat.HistoryPath>/subprompts/
-#
-# quest_barks is no longer needed for generated bark storage if you moved
-# quest bark cache to SQL.
-
-# Scan quoted .npcc gen direction plus copied NPC facts, then auto-attach
-# matching .prompt files from NpcChat.HistoryPath/subprompts.
-# DEPRECATED: not read by the current build (auto-subprompt generation was replaced by
-# NpcChat.SubPrompt.ImportOnStartup + NpcChat.SubPromptCreatorAccounts). Left here commented.
-# NpcChat.GenAutoSubPrompts = 1
-
-# Total auto-matched files allowed per generation.
-# NpcChat.GenAutoSubPromptMaxTotal = 6
-
-# Prevent one type/category from flooding the context.
-# NpcChat.GenAutoSubPromptMaxPerCategory = 2
-
-# Send a system message showing which auto-subprompts fired.
-# NpcChat.GenAutoSubPromptDebug = 1
-
-# Treat *.npc.prompt and *.relationship.prompt files as relationship/world context,
-# not as identity replacement.
-# NpcChat.GenAutoRelationshipPrompts = 1
-
-NpcChat.UntargetedChat.Enable = 1
-NpcChat.UntargetedChat.YellRange = 50
-NpcChat.UntargetedChat.HostileYell = 1
-
-
-###################################################################################################
-# MAINTENANCE ADDITIONS - keys the current build reads that were missing from this file
-###################################################################################################
-
-# Verify TLS certificate on HTTPS API calls. Set 0 only for a self-signed local proxy. Default: 1
-NpcChat.Api.VerifyCert = 1
-
-# Max simultaneous in-flight LLM requests across all worker threads (cost/socket guard). Default: 4
-NpcChat.Api.MaxConcurrentRequests = 4
-
-# Send a system message when a proximity bark is skipped or fired, for tuning. Default: 0
-NpcChat.BarkDebug = 0
-
-# Minimum seconds between bark-debug messages so they don't spam. Default: 15
-NpcChat.BarkDebugCooldownSec = 15
-
-# Import sub-prompt .prompt files from disk into SQL on startup (new rows only).
-# Force a full re-sync anytime with: .npcc sub import overwrite . Default: 1
-NpcChat.SubPrompt.ImportOnStartup = 1
-
-
-###################################################################################################
-# PLAYERBOT CHAT  - talk to playerbots (only genuine bots ever reply; real players never do)
-#
-# Reuses the main NpcChat.* API/model above.
-# Character identity uses the same simple card convention as mod-playerbots-characters:
-#   ./characters/ExactCharacterName.card.txt
-#
-# If a bot has no card when first spoken to, npc_chat_llm creates a fixed editable template locally.
-# No LLM request is spent generating that file. Existing cards are never overwritten, and the card
-# is read again on every conversation so manual edits take effect on the very next bot response.
-#
-# Personal conversation history stays separate under:
-#   <NpcChat.HistoryPath>/bots/personal/<player>/<bot-name>_<bot-guid>.history
-###################################################################################################
-
-# Master switch for ALL bot-chat surfaces (whisper / party-raid / target / LFG / guild).
-# Code default is 0; set to 1 to run the feature.
 NpcChat.Bot.Enable = 1
-
-# Directory containing PBC-compatible ExactCharacterName.card.txt files.
-# Point both modules at this same directory if you ever switch between them. Default: ./characters
 NpcChat.Bot.CharacterCardsPath = ./characters
-
-# Whisper a bot -> it whispers back. Default: 1
 NpcChat.Bot.ReplyWhisper = 1
-
-# Name a bot (or several) in party/raid -> each named bot replies in that channel. Default: 1
 NpcChat.Bot.ReplyPartyRaid = 1
-
-# Target a bot and /say within range -> it answers with a chat bubble. Default: 1
 NpcChat.Bot.ReplyTarget = 1
-
-# Max yards for the target-and-say surface. Default: 25
 NpcChat.Bot.TriggerRange = 25.0
-
-# Recent lines of (player+bot) history fed back to the model. Main cost dial. Default: 20
 NpcChat.Bot.HistoryMaxLines = 20
 
 ###################################################################################################
-# PLAYERBOT SOCIAL CHAT
-#
-# A real player's party/raid/guild message may start one bounded social conversation. Named bots
-# always count as an explicit invitation. Otherwise chance + cooldown decide whether chatter starts.
-# Non-random/alt bots are preferred; random playerbots can occasionally join so large raids feel alive.
+# Playerbot social party / raid / guild conversations
 ###################################################################################################
 NpcChat.Bot.Social.Enable = 1
 NpcChat.Bot.Social.PartyChancePct = 70
@@ -304,61 +168,26 @@ NpcChat.Bot.Social.GuildMaxSpeakers = 3
 NpcChat.Bot.Social.RandomBotChancePct = 25
 NpcChat.Bot.Social.CooldownSec = 20
 
-
-
 ###################################################################################################
-# PLAYERBOT GUILD PRESENCE - keep guild bots online while a real guild member is online
-#
-# This is deliberately stricter than "every offline guild character": only characters belonging
-# to configured Playerbots random-bot accounts (plus optional addclass bots) are eligible. Normal
-# human alts in the guild are ignored.
+# Keep actual Playerbots guild characters online while a real guild member is online
 ###################################################################################################
-
-# Master switch. Default: 1
 NpcChat.Bot.GuildPresence.Enable = 1
-
-# Per-guild rescan interval while at least one real guild member is online. Default: 10 seconds.
 NpcChat.Bot.GuildPresence.ScanIntervalSec = 10
-
-# Maximum offline guild bots requested per scan. Repeated scans continue until all eligible bots
-# are online. 0 = unlimited; a finite value avoids a login storm in very large guilds. Default: 20.
 NpcChat.Bot.GuildPresence.MaxLoginsPerScan = 20
-
-# Also allow Playerbots addclass characters to be treated as guild bots. Default: 1
 NpcChat.Bot.GuildPresence.IncludeAddClass = 1
 
-
 ###################################################################################################
-# PLAYERBOT LFG
+# Playerbot LFG / General
 ###################################################################################################
-
-# Master switch for LFG matchmaking. Default: 1
 NpcChat.Bot.Lfg.Enable = 1
-
-# Only match bots within this many levels of the requester (dungeon-bracket sanity). Default: 8
 NpcChat.Bot.Lfg.LevelBracket = 8
-
-# Run LFG matching on the General channel. Default: 1
 NpcChat.Bot.Lfg.General = 1
-
-# Run LFG matching on the Trade channel (global and spammier). Default: 0
 NpcChat.Bot.Lfg.Trade = 0
-
-# Ambient (non-LFG) General chatter: percent chance ONE local bot chimes in on a normal
-# message. 0 = off. This is the spammy/costly one - raise slowly after testing. Default: 0
 NpcChat.Bot.General.Chance = 0
 
-
 ###################################################################################################
-# PLAYERBOT GUILD CHAT  -  player-provoked only, never initiates, turn-capped (token guard)
+# Playerbot guild reply window
 ###################################################################################################
-
-# Master switch for guild-chat replies. Default: 1
 NpcChat.Bot.Guild.Enable = 1
-
-# Max replies a bot gives per conversation window before it goes quiet. Default: 4
 NpcChat.Bot.Guild.MaxTurns = 4
-
-# Idle seconds that closes a conversation window; afterward a fresh provocation may
-# start a new one. Default: 300
 NpcChat.Bot.Guild.WindowSec = 300

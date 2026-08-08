@@ -84,6 +84,27 @@ Private chat remains:
 !p Keep this between us.
 ```
 
+
+## Runtime config troubleshooting
+
+If **all** NPC and playerbot LLM chat stops at once, run:
+
+```text
+.npcc status
+```
+
+This reports the effective `NpcChat.Enable`, API/model presence, how many `NpcChat.*` options ConfigMgr actually loaded, and the runtime config path. If it reports zero loaded keys, the problem is the deployed module config, not NPC selection/history.
+
+After editing the deployed module config, use:
+
+```text
+.npcc reload
+```
+
+The command now rereads AzerothCore module config files from disk before refreshing NPC Chat values. Older builds only reread values already cached by ConfigMgr, which made a changed file appear to be ignored until restart.
+
+Keep only one copy of each `NpcChat.*` option in the runtime file. The source `conf/mod_npcchat.conf.dist` is now canonical and no longer contains conflicting duplicate QuestBarks/HostileFirstTalk blocks.
+
 ## Runtime file layout
 
 The module stores prompts and memory under `NpcChat.HistoryPath`.
