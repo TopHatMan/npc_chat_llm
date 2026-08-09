@@ -191,10 +191,12 @@ NpcChat.Bot.GuildPresence.MaxLoginsPerScan = 20
 NpcChat.Bot.GuildPresence.IncludeAddClass = 1
 
 ###################################################################################################
-# Autonomous low-frequency guild chatter while a real guild member is online
-# This is direct guild broadcast, so generated lines do not recurse through chat hooks.
+# Legacy autonomous guild chatter - DISABLED
+# Guild LLM traffic is intentionally player-driven only. Presence may keep bots online, but bots
+# do not spend API credits talking to each other while the real player is idle. Reactive guild
+# replies are handled by NpcChat.Bot.Social when a real player actually sends guild chat.
 ###################################################################################################
-NpcChat.Bot.GuildAmbient.Enable = 1
+NpcChat.Bot.GuildAmbient.Enable = 0
 NpcChat.Bot.GuildAmbient.MinIntervalSec = 90
 NpcChat.Bot.GuildAmbient.MaxIntervalSec = 240
 NpcChat.Bot.GuildAmbient.MaxSpeakers = 2

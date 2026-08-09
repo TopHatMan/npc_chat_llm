@@ -5964,7 +5964,9 @@ namespace
     // --- autonomous guild ambience ----------------------------------------------
     struct GuildAmbientCfg
     {
-        bool enable = true;
+        // Legacy implementation retained for now, but intentionally unscheduled.
+        // Keep disabled by default in case it is ever called explicitly during debugging.
+        bool enable = false;
         uint32 minIntervalSec = 90;
         uint32 maxIntervalSec = 240;
         int maxSpeakers = 2;
@@ -5975,7 +5977,7 @@ namespace
     inline GuildAmbientCfg GetGuildAmbientCfg()
     {
         GuildAmbientCfg c;
-        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.GuildAmbient.Enable", true, false);
+        c.enable = sConfigMgr->GetOption<bool>("NpcChat.Bot.GuildAmbient.Enable", false, false);
         c.minIntervalSec = std::max<uint32>(15,
             sConfigMgr->GetOption<uint32>("NpcChat.Bot.GuildAmbient.MinIntervalSec", 90, false));
         c.maxIntervalSec = std::max<uint32>(c.minIntervalSec,
@@ -7014,7 +7016,9 @@ public:
         // Guild presence is independent of whether the real player is currently
         // alive; dying/ghosting should not make their guild roster disappear.
         EnsureGuildBotsOnline(player);
-        MaybeStartGuildAmbientChat(player);
+        // Guild LLM traffic is player-driven only. Do not schedule autonomous bot-to-bot
+        // guild conversations from the player update loop; reactive guild chat is dispatched
+        // only when a real player actually sends a guild message.
 
         if (!player->IsAlive())
             return;

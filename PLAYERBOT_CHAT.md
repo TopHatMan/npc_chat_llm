@@ -129,7 +129,7 @@ NpcChat.Bot.Social.PartyCooldownSec = 4
 NpcChat.Bot.Social.CooldownSec = 20
 ```
 
-Named bot messages bypass the ambient chance roll. Ambient conversations use the chance and cooldown settings.
+Named bot messages bypass the chance roll. Party/raid/guild social generation is player-driven: no autonomous guild bot-to-bot LLM loop is scheduled.
 
 ## Keeping guild bots online
 
@@ -147,6 +147,10 @@ NpcChat.Bot.GuildPresence.IncludeAddClass = 1
 The login is routed through `RandomPlayerbotMgr` with no real-player master account, so these characters remain autonomous guild members rather than becoming followers of the player who happened to trigger the scan. A per-guild cooldown prevents the player update hook from querying the roster every frame, and the login cap spreads very large guilds across multiple scans.
 
 The module does **not** force guild bots to log out when the last real guild member leaves. Playerbots keeps ownership of the normal bot lifecycle. If Playerbots later logs one of these bots out while a real guild member is still online, a later guild-presence scan can request it again.
+
+### Guild token-safety rule
+
+Keeping guild bots online is separate from generating guild dialogue. `npc_chat_llm` does **not** start autonomous guild bot-to-bot LLM conversations from the player update loop. Guild LLM replies happen only after a real player sends guild chat through the reactive social path. This means an idle logged-in player does not cause periodic guild API spend, and once no real player is online there is no guild LLM trigger at all.
 
 ## Quick test checklist
 
