@@ -102,6 +102,21 @@ def main() -> int:
         for key in stale_config:
             print(f"  - {key}")
 
+    # Token-safety invariant: the legacy ambient implementation may remain for reference, but
+    # it must never be scheduled from the player update loop. Guild LLM work is reactive to
+    # actual real-player guild chat only.
+    ambient_calls = source.count("MaybeStartGuildAmbientChat(")
+    if ambient_calls != 1:
+        failed = True
+        print(
+            "ERROR: autonomous guild ambience was re-enabled or duplicated; "
+            f"expected only the dormant function definition, found {ambient_calls} references."
+        )
+
+    if "NpcChat.Bot.GuildAmbient.Enable = 0" not in conf:
+        failed = True
+        print("ERROR: canonical GuildAmbient setting must remain disabled (0).")
+
     aliases_seen = sorted(LEGACY_SOURCE_ONLY_ALIASES & source_set)
     print(
         f"NpcChat config contract: {len(config_set)} canonical keys, "
