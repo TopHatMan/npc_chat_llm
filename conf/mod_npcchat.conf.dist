@@ -156,6 +156,8 @@ NpcChat.QuestBarks.MaxQuestsCheckedPerNpc = 8
 ###################################################################################################
 # Playerbot direct chat / character cards
 ###################################################################################################
+# Player-driven bot RP only. Unsolicited playerbot say/party/channel chat is
+# ignored (bot speakers never start an LLM job). Whisper a bot yourself to talk.
 NpcChat.Bot.Enable = 1
 NpcChat.Bot.CharacterCardsPath = ./characters
 NpcChat.Bot.ReplyWhisper = 1

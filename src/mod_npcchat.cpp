@@ -6963,9 +6963,14 @@ public:
         return lang == static_cast<uint32>(LANG_ADDON);
     }
 
+    static bool IsBotSpeaker(Player* player)
+    {
+        return player && player->GetSession() && player->GetSession()->IsBot();
+    }
+
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg) override
     {
-        if (IsAddonTraffic(lang))
+        if (IsAddonTraffic(lang) || IsBotSpeaker(player))
             return true;
         return HandleNpcChat(player, type, msg);
     }
@@ -6974,7 +6979,8 @@ public:
     {
         // WoW addons commonly use whisper transport with LANG_ADDON. Let the addon packet
         // continue through AzerothCore, but never reinterpret it as player -> bot RP dialogue.
-        if (IsAddonTraffic(lang))
+        // Bot-originated chat must never start an LLM job (playerbots unsolicited talk).
+        if (IsAddonTraffic(lang) || IsBotSpeaker(player))
             return true;
         HandleBotWhisper(player, type, receiver, TrimCopy(msg));
         return HandleNpcChat(player, type, msg);
@@ -6982,7 +6988,7 @@ public:
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Group* group) override
     {
-        if (IsAddonTraffic(lang))
+        if (IsAddonTraffic(lang) || IsBotSpeaker(player))
             return true;
         HandleBotGroup(player, type, group, TrimCopy(msg));
         return HandleNpcChat(player, type, msg);
@@ -6990,7 +6996,7 @@ public:
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Guild* guild) override
     {
-        if (IsAddonTraffic(lang))
+        if (IsAddonTraffic(lang) || IsBotSpeaker(player))
             return true;
         HandleBotGuild(player, type, guild, TrimCopy(msg));
         return true;
@@ -6998,7 +7004,7 @@ public:
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Channel* channel) override
     {
-        if (IsAddonTraffic(lang))
+        if (IsAddonTraffic(lang) || IsBotSpeaker(player))
             return true;
         HandleBotChannel(player, type, channel, TrimCopy(msg));
         return true;
