@@ -41,8 +41,9 @@ Still contains most game-facing behavior. It owns:
 - world-thread chat emission
 - bark/cache systems
 - playerbot direct/social/guild/LFG behavior
-- guild bot presence
 - `.npcc` commands
+
+Guild bot login is not this module's job. It was transplanted to `mod-playerbots` (`GuildPresenceMgr` / `Sim.*`). This module chats with bots that are already online.
 
 This file is still larger than desirable. The stabilization pass intentionally avoids a giant mechanical file split while runtime behavior is being repaired.
 

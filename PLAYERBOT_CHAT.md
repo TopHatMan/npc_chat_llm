@@ -131,26 +131,15 @@ NpcChat.Bot.Social.CooldownSec = 20
 
 Named bot messages bypass the chance roll. Party/raid/guild social generation is player-driven: no autonomous guild bot-to-bot LLM loop is scheduled.
 
-## Keeping guild bots online
+## Guild bots: chat only, never login
 
-`NpcChat.Bot.GuildPresence.Enable = 1` makes guild presence follow the **real players** in that guild. While at least one real guild member is online, `npc_chat_llm` periodically scans the guild roster and asks Playerbots to log in eligible offline guild bots.
+Guild force-login used to live in this module (`NpcChat.Bot.GuildPresence.*`). That scan was transplanted into `mod-playerbots` (`AiPlayerbot.GuildPresence.*`, default off) so the population calendar owns who is online.
 
-This does **not** mean "log in every offline character in the guild." The module checks the character's account against Playerbots' configured random-bot account list, and can optionally include Playerbots addclass characters. Ordinary human alts are ignored.
-
-```ini
-NpcChat.Bot.GuildPresence.Enable = 1
-NpcChat.Bot.GuildPresence.ScanIntervalSec = 10
-NpcChat.Bot.GuildPresence.MaxLoginsPerScan = 20
-NpcChat.Bot.GuildPresence.IncludeAddClass = 1
-```
-
-The login is routed through `RandomPlayerbotMgr` with no real-player master account, so these characters remain autonomous guild members rather than becoming followers of the player who happened to trigger the scan. A per-guild cooldown prevents the player update hook from querying the roster every frame, and the login cap spreads very large guilds across multiple scans.
-
-The module does **not** force guild bots to log out when the last real guild member leaves. Playerbots keeps ownership of the normal bot lifecycle. If Playerbots later logs one of these bots out while a real guild member is still online, a later guild-presence scan can request it again.
+`npc_chat_llm` may still generate guild chat for bots that are **already** online. If no guild bot is online, guild chat is silent. This module must not login a bot to greet.
 
 ### Guild token-safety rule
 
-Keeping guild bots online is separate from generating guild dialogue. `npc_chat_llm` does **not** start autonomous guild bot-to-bot LLM conversations from the player update loop. Guild LLM replies happen only after a real player sends guild chat through the reactive social path. This means an idle logged-in player does not cause periodic guild API spend, and once no real player is online there is no guild LLM trigger at all.
+`npc_chat_llm` does **not** start autonomous guild bot-to-bot LLM conversations from the player update loop. Guild LLM replies happen only after a real player sends guild chat through the reactive social path. An idle logged-in player does not cause periodic guild API spend, and once no real player is online there is no guild LLM trigger at all.
 
 ## Quick test checklist
 
@@ -163,9 +152,9 @@ Keeping guild bots online is separate from generating guild dialogue. `npc_chat_
 7. Manually whisper the bot afterward and confirm it still answers normally.
 8. Put several playerbots in a party and send a normal party message; confirm only a bounded set replies.
 9. Repeat in raid chat and confirm the raid speaker cap is respected.
-10. Log in a real guild member with several eligible guild bots offline; within the configured scans, confirm those bot characters appear online in the guild roster.
+10. With a real guild member online and **no** guild bots online, send guild chat and confirm the module does **not** login a bot to reply.
 11. Confirm an ordinary non-bot alt in the same guild remains offline.
-12. Send a guild message after the bots have logged in and confirm a small multi-bot conversation can occur.
+12. If a guild bot happens to already be online, send a guild message and confirm a small multi-bot conversation can occur.
 13. Name one specific bot and confirm it is favored as a speaker.
 14. Confirm recent bot history remains under `NpcChat.HistoryPath/bots/personal/` and no GUID-based `.card` files are created.
 

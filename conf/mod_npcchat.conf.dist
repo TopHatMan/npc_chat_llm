@@ -185,18 +185,15 @@ NpcChat.Bot.Social.PartyCooldownSec = 4
 NpcChat.Bot.Social.CooldownSec = 20
 
 ###################################################################################################
-# Keep actual Playerbots guild characters online while a real guild member is online
+# Guild bot login was transplanted to mod-playerbots (AiPlayerbot.GuildPresence.* / Sim.*).
+# This module must not login bots. Guild chat still replies to whoever is already online.
 ###################################################################################################
-NpcChat.Bot.GuildPresence.Enable = 1
-NpcChat.Bot.GuildPresence.ScanIntervalSec = 10
-NpcChat.Bot.GuildPresence.MaxLoginsPerScan = 20
-NpcChat.Bot.GuildPresence.IncludeAddClass = 1
 
 ###################################################################################################
 # Legacy autonomous guild chatter - DISABLED
-# Guild LLM traffic is intentionally player-driven only. Presence may keep bots online, but bots
-# do not spend API credits talking to each other while the real player is idle. Reactive guild
-# replies are handled by NpcChat.Bot.Social when a real player actually sends guild chat.
+# Guild LLM traffic is intentionally player-driven only. Bots do not spend API credits talking
+# to each other while the real player is idle. Reactive guild replies are handled by
+# NpcChat.Bot.Social when a real player actually sends guild chat.
 ###################################################################################################
 NpcChat.Bot.GuildAmbient.Enable = 0
 NpcChat.Bot.GuildAmbient.MinIntervalSec = 90
