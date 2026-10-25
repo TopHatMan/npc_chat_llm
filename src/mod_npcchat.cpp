@@ -1780,7 +1780,7 @@ namespace
             return;
 
         WorldSession* session = player->GetSession();
-        if (!session || session->IsBot())
+        if (!session || session->IsHeadless())
             return;
 
         uint64 key = player->GetGUID().GetRawValue();
@@ -2401,7 +2401,7 @@ namespace
             return false;
         }
 
-        if (g_RelationshipBarksRealPlayersOnly && session->IsBot())
+        if (g_RelationshipBarksRealPlayersOnly && session->IsHeadless())
         {
             if (reason) *reason = "Bots do not trigger relationship barks.";
             return false;
@@ -2624,7 +2624,7 @@ namespace
             return false;
         }
 
-        if (g_HostileFirstTalkRealPlayersOnly && session->IsBot())
+        if (g_HostileFirstTalkRealPlayersOnly && session->IsHeadless())
         {
             if (reason) *reason = "Bots do not trigger hostile first-talk barks.";
             return false;
@@ -2951,7 +2951,7 @@ namespace
             if (reason) *reason = "No player session.";
             return false;
         }
-        if (g_TrainerBarksRealPlayersOnly && session->IsBot())
+        if (g_TrainerBarksRealPlayersOnly && session->IsHeadless())
         {
             if (reason) *reason = "Bots do not trigger trainer barks.";
             return false;
@@ -3054,7 +3054,7 @@ namespace
             if (reason) *reason = "No player session.";
             return false;
         }
-        if (g_TrainerBarksRealPlayersOnly && session->IsBot())
+        if (g_TrainerBarksRealPlayersOnly && session->IsHeadless())
         {
             if (reason) *reason = "Bots do not trigger trainer barks.";
             return false;
@@ -4600,7 +4600,7 @@ namespace
             if (reason) *reason = "No player session.";
             return false;
         }
-        if (g_QuestBarksRealPlayersOnly && session->IsBot())
+        if (g_QuestBarksRealPlayersOnly && session->IsHeadless())
         {
             if (reason) *reason = "Bots do not trigger quest barks.";
             return false;
@@ -4766,7 +4766,7 @@ namespace
             if (reason) *reason = "No player session.";
             return false;
         }
-        if (g_QuestBarksRealPlayersOnly && session->IsBot())
+        if (g_QuestBarksRealPlayersOnly && session->IsHeadless())
         {
             if (reason) *reason = "Bots do not trigger quest barks.";
             return false;
@@ -5139,7 +5139,7 @@ namespace
     {
         if (!g_HistoryWhispersEnabled || !player || !npc || !npc->IsAlive())
             return false;
-        if (!player->GetSession() || player->GetSession()->IsBot())
+        if (!player->GetSession() || player->GetSession()->IsHeadless())
             return false;
         if (player->IsInCombat() || npc->IsInCombat())
         {
@@ -5195,11 +5195,11 @@ namespace
 // --- gate ------------------------------------------------------------------
     inline bool IsGenuineBot(Player* p)
     {
-        return p && p->GetSession() && p->GetSession()->IsBot();
+        return p && p->GetSession() && p->GetSession()->IsHeadless();
     }
     inline bool IsRealPlayerSession(Player* p)
     {
-        return p && p->GetSession() && !p->GetSession()->IsBot();
+        return p && p->GetSession() && !p->GetSession()->IsHeadless();
     }
 
     // --- config (NpcChat.Bot.*) ------------------------------------------------
@@ -6864,7 +6864,7 @@ public:
 
     static bool IsBotSpeaker(Player* player)
     {
-        return player && player->GetSession() && player->GetSession()->IsBot();
+        return player && player->GetSession() && player->GetSession()->IsHeadless();
     }
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg) override
@@ -6915,7 +6915,7 @@ public:
             return;
 
         WorldSession* session = player->GetSession();
-        if (!session || session->IsBot())
+        if (!session || session->IsHeadless())
             return;
 
         // Guild LLM traffic is player-driven only. Do not login bots and do not
@@ -7119,7 +7119,7 @@ private:
             return true;
 
         WorldSession* session = player->GetSession();
-        if (!session || session->IsBot())
+        if (!session || session->IsHeadless())
             return true;
 
         std::string text = TrimCopy(msg);
